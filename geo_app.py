@@ -12,6 +12,7 @@ import os
 import sys
 import json
 from urllib.parse import quote
+from convert_to_wgs84 import gcj02_to_wgs84
 
 # ========== 配置管理 ==========
 
@@ -187,7 +188,7 @@ class GeoApp:
     def __init__(self, root):
         self.root = root
         self.root.title("地址经纬度查询工具")
-        self.root.geometry("700x620")
+        self.root.geometry("700x660")
         self.root.resizable(False, False)
         self.root.configure(bg='#fafafa')
         self._build_ui()
@@ -266,7 +267,9 @@ class GeoApp:
         self.result_frame.pack(fill='x', pady=(8, 0))
         self.result_labels = {}
         fields = [
-            ('status', '状态'), ('method', '匹配方式'), ('lng', '经度'), ('lat', '纬度'),
+            ('status', '状态'), ('method', '匹配方式'),
+            ('lng', '经度(GCJ-02)'), ('lat', '纬度(GCJ-02)'),
+            ('wgs_lng', 'WGS-84经度'), ('wgs_lat', 'WGS-84纬度'),
             ('province', '省份'), ('city', '城市'), ('district', '区县'),
             ('address', '地址'), ('name', 'POI名称'), ('type', '类型')
         ]
@@ -472,8 +475,19 @@ class GeoApp:
         else:
             self.result_labels['status'].configure(text="  精度较低  ")
         self.result_labels['method'].configure(text=f"  {data.get('method', '—')}  ")
-        self.result_labels['lng'].configure(text=str(data.get('lng', '—')))
-        self.result_labels['lat'].configure(text=str(data.get('lat', '—')))
+        lng = data.get('lng', '—')
+        lat = data.get('lat', '—')
+        self.result_labels['lng'].configure(text=str(lng))
+        self.result_labels['lat'].configure(text=str(lat))
+        # 计算并显示 WGS-84 坐标
+        if lng != '—' and lat != '—':
+            try:
+                wgs_lng, wgs_lat = gcj02_to_wgs84(float(lng), float(lat))
+                self.result_labels['wgs_lng'].configure(text=str(wgs_lng))
+                self.result_labels['wgs_lat'].configure(text=str(wgs_lat))
+            except Exception:
+                self.result_labels['wgs_lng'].configure(text='转换失败')
+                self.result_labels['wgs_lat'].configure(text='转换失败')
         self.result_labels['province'].configure(text=data.get('province', '—'))
         self.result_labels['city'].configure(text=data.get('city', '—'))
         self.result_labels['district'].configure(text=data.get('district', '—'))
@@ -567,6 +581,8 @@ class GeoApp:
 
                 df['经度'] = None
                 df['纬度'] = None
+                df['WGS84经度'] = None
+                df['WGS84纬度'] = None
                 df['省份'] = None
                 df['城市'] = None
                 df['区县'] = None
@@ -585,6 +601,13 @@ class GeoApp:
                     if result:
                         df.at[idx, '经度'] = result['lng']
                         df.at[idx, '纬度'] = result['lat']
+                        # 计算 WGS-84 坐标
+                        try:
+                            wgs_lng, wgs_lat = gcj02_to_wgs84(float(result['lng']), float(result['lat']))
+                            df.at[idx, 'WGS84经度'] = wgs_lng
+                            df.at[idx, 'WGS84纬度'] = wgs_lat
+                        except Exception:
+                            pass
                         df.at[idx, '省份'] = result.get('province', '')
                         df.at[idx, '城市'] = result.get('city', '')
                         df.at[idx, '区县'] = result.get('district', '')
