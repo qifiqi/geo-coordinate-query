@@ -12,7 +12,7 @@ import os
 import sys
 import json
 from urllib.parse import quote
-from convert_to_wgs84 import gcj02_to_wgs84
+from convert_to_wgs84 import gcj02_to_wgs84, wgs84_to_gcj02
 
 # ========== 配置管理 ==========
 
@@ -73,7 +73,8 @@ def geocode_search(keyword, api_key=None):
                 'lng': float(lng), 'lat': float(lat),
                 'province': province, 'city': city, 'district': district,
                 'address': formatted, 'level': level,
-                'accurate': is_accurate, 'method': 'geocode'
+                'accurate': is_accurate, 'method': 'geocode',
+                'coord_type': 'GCJ-02'
             }
     except:
         pass
@@ -101,7 +102,8 @@ def poi_search(keyword, city='', api_key=None):
                 'name': poi.get('name', ''),
                 'tel': poi.get('tel', ''),
                 'type': poi.get('type', ''),
-                'accurate': True, 'method': 'POI'
+                'accurate': True, 'method': 'POI',
+                'coord_type': 'GCJ-02'
             }
     except:
         pass
@@ -127,6 +129,76 @@ def smart_search(keyword):
             return result
 
     return candidates[0] if candidates else None
+
+# ========== 地址相似度验证 ==========
+
+def address_similarity(input_addr, api_result):
+    """计算用户输入地址与API返回地址的相似度（0~1）
+
+    算法：
+    1. 最长公共子序列(LCS)比率 —— 保留字符顺序，适合地址/地名混合输入
+    2. 以较短串为基准归一化 —— 短地名匹配长地址时不会系统性偏低
+    3. 省市区结构化字段加权 —— 提升行政区匹配的可信度
+    """
+    if not input_addr or not api_result:
+        return 0.0
+
+    def _clean(s):
+        return str(s).replace(' ', '').replace('(', '').replace(')', '') \
+                     .replace('（', '').replace('）', '') \
+                     .replace('[', '').replace(']', '')
+
+    # 取 API 返回的地址或名称
+    api_addr = _clean(api_result.get('address', '') or api_result.get('name', ''))
+    input_clean = _clean(input_addr)
+    if not api_addr or not input_clean:
+        return 0.0
+
+    # --- 最长公共子序列(LCS)长度 ---
+    m, n = len(input_clean), len(api_addr)
+    # 空间优化：只保留两行
+    prev = [0] * (n + 1)
+    curr = [0] * (n + 1)
+    for i in range(1, m + 1):
+        for j in range(1, n + 1):
+            if input_clean[i - 1] == api_addr[j - 1]:
+                curr[j] = prev[j - 1] + 1
+            else:
+                curr[j] = max(prev[j], curr[j - 1])
+        prev, curr = curr, [0] * (n + 1)
+    lcs_len = prev[n]
+
+    # 以较短串为基准归一化（短地名 vs 长地址不会偏低）
+    min_len = min(m, n)
+    max_len = max(m, n)
+    lcs_ratio = lcs_len / min_len if min_len > 0 else 0.0
+
+    # 长度惩罚：两者长度差距越大，对比率打一定折扣
+    length_factor = min_len / max_len if max_len > 0 else 1.0
+    sequence_score = lcs_ratio * (0.7 + 0.3 * length_factor)
+
+    # 包含关系加成：较短串完全包含在较长串中时，大幅提升分数
+    shorter = input_clean if m <= n else api_addr
+    longer = api_addr if m <= n else input_clean
+    if shorter in longer:
+        # 完全包含时，以占比为基准（如“黎黄陂路”在“武汉市江岸区黎黄陂路”中占 4/11）
+        contain_ratio = len(shorter) / len(longer) if len(longer) > 0 else 1.0
+        sequence_score = max(sequence_score, 0.85 + 0.15 * contain_ratio)
+
+    # --- 结构化字段加权 ---
+    bonus = 0.0
+    province = api_result.get('province', '')
+    city = api_result.get('city', '')
+    district = api_result.get('district', '')
+    if province and province in input_addr:
+        bonus += 0.08
+    if city and str(city) != '[]' and str(city) in input_addr:
+        bonus += 0.08
+    if district and district in input_addr:
+        bonus += 0.14
+
+    score = min(1.0, sequence_score * (0.70 + 0.30 * sequence_score) + bonus)
+    return round(score, 2)
 
 # ========== Excel处理函数 ==========
 
@@ -188,7 +260,7 @@ class GeoApp:
     def __init__(self, root):
         self.root = root
         self.root.title("地址经纬度查询工具")
-        self.root.geometry("700x660")
+        self.root.geometry("750x720")
         self.root.resizable(False, False)
         self.root.configure(bg='#fafafa')
         self._build_ui()
@@ -219,6 +291,9 @@ class GeoApp:
         style.configure('StatusLow.TLabel', font=('微软雅黑', 9), foreground='#e65100', background='#fff3e0')
         style.configure('StatusFail.TLabel', font=('微软雅黑', 9), foreground='#c62828', background='#ffebee')
         style.configure('Method.TLabel', font=('Consolas', 9), foreground='#1565c0', background='#e3f2fd')
+        style.configure('SimHigh.TLabel', font=('Consolas', 9), foreground='#2e7d32', background='#e8f5e9')
+        style.configure('SimMid.TLabel', font=('Consolas', 9), foreground='#e65100', background='#fff3e0')
+        style.configure('SimLow.TLabel', font=('Consolas', 9), foreground='#c62828', background='#ffebee')
         style.configure('CopyBtn.TLabel', font=('微软雅黑', 8), foreground='#5c6bc0', background='#e8eaf6')
         style.configure('CopyBtnRow.TLabel', font=('微软雅黑', 8), foreground='#5c6bc0', background='#f5f5f5')
         style.configure('FieldLabel.TLabel', font=('微软雅黑', 10), foreground=GREY, background='#fafafa')
@@ -237,6 +312,11 @@ class GeoApp:
         query_tab = ttk.Frame(self.notebook, padding=12)
         self.notebook.add(query_tab, text="  地址查询  ")
         self._build_query_tab(query_tab)
+
+        # 坐标转换工具标签页
+        convert_tab = ttk.Frame(self.notebook, padding=12)
+        self.notebook.add(convert_tab, text="  坐标转换工具  ")
+        self._build_convert_tab(convert_tab)
 
         # Tab 2: 设置
         settings_tab = ttk.Frame(self.notebook, padding=12)
@@ -270,6 +350,7 @@ class GeoApp:
             ('status', '状态'), ('method', '匹配方式'),
             ('lng', '经度(GCJ-02)'), ('lat', '纬度(GCJ-02)'),
             ('wgs_lng', 'WGS-84经度'), ('wgs_lat', 'WGS-84纬度'),
+            ('similarity', '地址相似度'), ('coord_type', '坐标系'),
             ('province', '省份'), ('city', '城市'), ('district', '区县'),
             ('address', '地址'), ('name', 'POI名称'), ('type', '类型')
         ]
@@ -318,6 +399,234 @@ class GeoApp:
         self.log_text.configure(yscrollcommand=scrollbar.set)
         self.log_text.pack(side='left', fill='both', expand=True)
         scrollbar.pack(side='right', fill='y')
+
+    # ===== 坐标转换工具选项卡 =====
+    def _build_convert_tab(self, parent):
+        # 标题
+        ttk.Label(parent, text="坐标转换工具", style='Title.TLabel').pack(pady=(0, 8))
+        ttk.Label(parent, text="支持 GCJ-02 ↔ WGS-84 坐标系互相转换", style='Section.TLabel').pack(pady=(0, 8))
+
+        # 单个经纬度转换
+        single_frame = ttk.LabelFrame(parent, text="  单个经纬度转换  ", padding=10)
+        single_frame.pack(fill='x', pady=(0, 6))
+
+        # 转换方向选择
+        dir_row = ttk.Frame(single_frame)
+        dir_row.pack(fill='x', pady=(0, 6))
+        ttk.Label(dir_row, text="转换方向:", style='Section.TLabel').pack(side='left')
+        self.convert_dir_var = tk.StringVar(value='gcj_to_wgs')
+        ttk.Radiobutton(dir_row, text='GCJ-02 → WGS-84', variable=self.convert_dir_var,
+                        value='gcj_to_wgs').pack(side='left', padx=(10, 5))
+        ttk.Radiobutton(dir_row, text='WGS-84 → GCJ-02', variable=self.convert_dir_var,
+                        value='wgs_to_gcj').pack(side='left', padx=5)
+
+        # 输入行
+        input_row = ttk.Frame(single_frame)
+        input_row.pack(fill='x', pady=(0, 4))
+        ttk.Label(input_row, text="经度:", style='Section.TLabel').pack(side='left')
+        self.convert_lng_entry = ttk.Entry(input_row, width=18, font=('Consolas', 10))
+        self.convert_lng_entry.pack(side='left', padx=(4, 12))
+        ttk.Label(input_row, text="纬度:", style='Section.TLabel').pack(side='left')
+        self.convert_lat_entry = ttk.Entry(input_row, width=18, font=('Consolas', 10))
+        self.convert_lat_entry.pack(side='left', padx=(4, 12))
+        ttk.Button(input_row, text="转换", style='Accent.TButton',
+                   command=self._do_single_convert).pack(side='right')
+
+        # 结果行
+        result_row = ttk.Frame(single_frame)
+        result_row.pack(fill='x')
+        ttk.Label(result_row, text="转换结果:", style='Section.TLabel').pack(side='left')
+        self.convert_result_var = tk.StringVar(value="—")
+        self.convert_result_lbl = ttk.Label(result_row, textvariable=self.convert_result_var,
+                                            style='ResultBold.TLabel', cursor='hand2')
+        self.convert_result_lbl.pack(side='left', padx=(6, 0))
+        self.convert_result_lbl.bind('<Button-1>', lambda e: self._copy_convert_result())
+
+        # 批量文件转换
+        batch_frame = ttk.LabelFrame(parent, text="  批量文件转换  ", padding=10)
+        batch_frame.pack(fill='x', pady=(0, 6))
+
+        # 列名规范提示
+        ttk.Label(batch_frame,
+                  text="Excel要求: 必须包含 \"\u7ecf\u5ea6\" 和 \"\u7eac\u5ea6\" 列（GCJ-02坐标系）",
+                  style='Tip.TLabel').pack(anchor='w', pady=(0, 6))
+
+        file_row = ttk.Frame(batch_frame)
+        file_row.pack(fill='x')
+        ttk.Label(file_row, text="Excel文件:", style='Section.TLabel').pack(side='left')
+        self.convert_file_var = tk.StringVar()
+        ttk.Entry(file_row, textvariable=self.convert_file_var, width=38,
+                  font=('微软雅黑', 9), state='readonly').pack(side='left', padx=(5, 8), fill='x', expand=True)
+        ttk.Button(file_row, text="选择文件", command=self._pick_convert_file).pack(side='right')
+
+        btn_row = ttk.Frame(batch_frame)
+        btn_row.pack(fill='x', pady=(6, 0))
+        self.convert_batch_btn = ttk.Button(btn_row, text="开始批量转换", style='Accent.TButton',
+                                            command=self._do_batch_convert)
+        self.convert_batch_btn.pack(side='left')
+        self.convert_batch_status = ttk.Label(btn_row, text="", style='Info.TLabel')
+        self.convert_batch_status.pack(side='left', padx=10)
+
+        # 进度条
+        self.convert_progress = ttk.Progressbar(parent, length=700, mode='determinate')
+        self.convert_progress.pack(fill='x', pady=(0, 4))
+
+        # 转换日志
+        log_frame = ttk.LabelFrame(parent, text="  转换日志  ", padding=5)
+        log_frame.pack(fill='both', expand=True, pady=(0, 6))
+        self.convert_log_text = tk.Text(log_frame, height=5, font=('Consolas', 8), state='disabled', wrap='word')
+        scrollbar = ttk.Scrollbar(log_frame, orient='vertical', command=self.convert_log_text.yview)
+        self.convert_log_text.configure(yscrollcommand=scrollbar.set)
+        self.convert_log_text.pack(side='left', fill='both', expand=True)
+        scrollbar.pack(side='right', fill='y')
+
+        # 操作说明
+        guide_frame = ttk.LabelFrame(parent, text="  使用说明  ", padding=10)
+        guide_frame.pack(fill='x')
+
+        guide_text = (
+            "坐标系说明:\n"
+            "  • GCJ-02: 国测局坐标系，高德地图/腾讯地图等国内地图商使用的加密坐标系\n"
+            "  • WGS-84: 世界大地坐标系，GPS原始坐标、Google Earth、国际通用坐标系\n\n"
+            "单个转换: 直接输入经纬度，选择转换方向，点击转换按钮即可\n"
+            "批量转换: 上传包含 \"\u7ecf\u5ea6\" 和 \"\u7eac\u5ea6\" 列的Excel文件，自动转换并生成新文件\n"
+            "输出文件: 批量转换结果保存在原文件同目录下，文件名后缀为 _WGS84.xlsx\n"
+            "点击结果: 转换结果可点击复制到剪贴板"
+        )
+        ttk.Label(guide_frame, text=guide_text, style='Step.TLabel',
+                  justify='left').pack(anchor='w')
+
+    def _do_single_convert(self):
+        """单个经纬度转换"""
+        lng_str = self.convert_lng_entry.get().strip()
+        lat_str = self.convert_lat_entry.get().strip()
+        if not lng_str or not lat_str:
+            messagebox.showwarning("提示", "请输入经度和纬度")
+            return
+        try:
+            lng = float(lng_str)
+            lat = float(lat_str)
+        except ValueError:
+            messagebox.showerror("格式错误", "经纬度必须是数字，例如: 114.298572, 30.572815")
+            return
+        if not (-180 <= lng <= 180):
+            messagebox.showerror("范围错误", f"经度必须在 -180 到 180 之间，当前: {lng}")
+            return
+        if not (-90 <= lat <= 90):
+            messagebox.showerror("范围错误", f"纬度必须在 -90 到 90 之间，当前: {lat}")
+            return
+
+        direction = self.convert_dir_var.get()
+        try:
+            if direction == 'gcj_to_wgs':
+                out_lng, out_lat = gcj02_to_wgs84(lng, lat)
+                label = "WGS-84"
+            else:
+                out_lng, out_lat = wgs84_to_gcj02(lng, lat)
+                label = "GCJ-02"
+            result_text = f"{out_lng}, {out_lat}  ({label})"
+            self.convert_result_var.set(result_text)
+            self._convert_log(f"[{direction.upper()}] {lng},{lat} -> {out_lng},{out_lat}")
+        except Exception as e:
+            self.convert_result_var.set("转换失败")
+            self._convert_log(f"转换失败: {str(e)}")
+
+    def _copy_convert_result(self):
+        """复制转换结果"""
+        text = self.convert_result_var.get()
+        if not text or text == '—':
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text.strip())
+
+    def _pick_convert_file(self):
+        path = filedialog.askopenfilename(
+            title="选择Excel文件",
+            filetypes=[("Excel文件", "*.xlsx *.xls")],
+            initialdir=_get_app_dir()
+        )
+        if path:
+            self.convert_file_var.set(path)
+
+    def _convert_log(self, msg):
+        self.convert_log_text.configure(state='normal')
+        self.convert_log_text.insert('end', msg + '\n')
+        self.convert_log_text.see('end')
+        self.convert_log_text.configure(state='disabled')
+        self.root.update_idletasks()
+
+    def _do_batch_convert(self):
+        """批量坐标转换"""
+        file_path = self.convert_file_var.get().strip()
+        if not file_path or not os.path.exists(file_path):
+            messagebox.showwarning("提示", "请先选择有效的Excel文件")
+            return
+
+        self.convert_batch_btn.configure(state='disabled')
+        self.convert_progress['value'] = 0
+
+        def task():
+            try:
+                df = pd.read_excel(file_path)
+                # 检查必须包含经度和纬度列
+                if '经度' not in df.columns or '纬度' not in df.columns:
+                    self.root.after(0, lambda: messagebox.showerror("格式错误",
+                        "Excel文件必须包含 \"\u7ecf\u5ea6\" 和 \"\u7eac\u5ea6\" 列！\n"
+                        "请检查列名是否正确。"))
+                    self.root.after(0, lambda: self.convert_batch_btn.configure(state='normal'))
+                    return
+
+                total = len(df)
+                self.root.after(0, lambda: self._convert_log(
+                    f"读取文件: {os.path.basename(file_path)}，共{total}行"))
+
+                df['WGS84经度'] = None
+                df['WGS84纬度'] = None
+                converted = 0
+                failed = 0
+
+                for idx, row in df.iterrows():
+                    lng = row.get('经度')
+                    lat = row.get('纬度')
+                    if pd.notna(lng) and pd.notna(lat):
+                        try:
+                            wgs_lng, wgs_lat = gcj02_to_wgs84(float(lng), float(lat))
+                            df.at[idx, 'WGS84经度'] = wgs_lng
+                            df.at[idx, 'WGS84纬度'] = wgs_lat
+                            converted += 1
+                            self.root.after(0, lambda i=idx, t=total, wl=wgs_lng, wa=wgs_lat:
+                                self._convert_log(f"[{i+1}/{t}] OK -> {wl},{wa}"))
+                        except Exception:
+                            failed += 1
+                            self.root.after(0, lambda i=idx:
+                                self._convert_log(f"[{i+1}] 失败: 经纬度格式错误"))
+                    else:
+                        failed += 1
+
+                    pct = (idx + 1) / total * 100
+                    self.root.after(0, lambda p=pct: self.convert_progress.configure(value=p))
+                    self.root.after(0, lambda i=idx, t=total:
+                        self.convert_batch_status.configure(text=f"转换中 {i+1}/{t}"))
+                    time.sleep(0.05)
+
+                dir_path = os.path.dirname(file_path)
+                base_name = os.path.splitext(os.path.basename(file_path))[0]
+                output_file = os.path.join(dir_path, f"{base_name}_WGS84.xlsx")
+                df.to_excel(output_file, index=False, engine='openpyxl')
+
+                summary = f"完成! 转换成功:{converted} 失败:{failed} 共:{total}"
+                self.root.after(0, lambda: self._convert_log(summary))
+                self.root.after(0, lambda: self.convert_batch_status.configure(text=summary))
+                self.root.after(0, lambda: messagebox.showinfo("转换完成",
+                    f"结果已保存到:\n{output_file}\n\n转换成功: {converted}\n失败: {failed}"))
+
+            except Exception as e:
+                self.root.after(0, lambda: messagebox.showerror("错误", f"处理失败:\n{str(e)}"))
+                self.root.after(0, lambda: self._convert_log(f"错误: {str(e)}"))
+            finally:
+                self.root.after(0, lambda: self.convert_batch_btn.configure(state='normal'))
+
+        threading.Thread(target=task, daemon=True).start()
 
     # ===== 设置选项卡 =====
     def _build_settings_tab(self, parent):
@@ -464,7 +773,7 @@ class GeoApp:
         if path:
             self.file_var.set(path)
 
-    def _set_result(self, data):
+    def _set_result(self, data, input_keyword=''):
         for key, lbl in self.result_labels.items():
             lbl.configure(text="—")
         if data is None:
@@ -475,6 +784,7 @@ class GeoApp:
         else:
             self.result_labels['status'].configure(text="  精度较低  ")
         self.result_labels['method'].configure(text=f"  {data.get('method', '—')}  ")
+        self.result_labels['coord_type'].configure(text=f"  {data.get('coord_type', 'GCJ-02')}  ")
         lng = data.get('lng', '—')
         lat = data.get('lat', '—')
         self.result_labels['lng'].configure(text=str(lng))
@@ -488,6 +798,18 @@ class GeoApp:
             except Exception:
                 self.result_labels['wgs_lng'].configure(text='转换失败')
                 self.result_labels['wgs_lat'].configure(text='转换失败')
+        # 计算并显示地址相似度
+        sim = address_similarity(input_keyword, data) if input_keyword else 0.0
+        sim_lbl = self.result_labels.get('similarity')
+        if sim_lbl:
+            sim_text = f"{sim:.0%}" if sim > 0 else "—"
+            sim_lbl.configure(text=f"  {sim_text}  ")
+            if sim >= 0.6:
+                sim_lbl.configure(style='SimHigh.TLabel')
+            elif sim >= 0.4:
+                sim_lbl.configure(style='SimMid.TLabel')
+            else:
+                sim_lbl.configure(style='SimLow.TLabel')
         self.result_labels['province'].configure(text=data.get('province', '—'))
         self.result_labels['city'].configure(text=data.get('city', '—'))
         self.result_labels['district'].configure(text=data.get('district', '—'))
@@ -554,9 +876,11 @@ class GeoApp:
 
         def task():
             result = smart_search(keyword)
-            self.root.after(0, lambda: self._set_result(result))
+            self.root.after(0, lambda: self._set_result(result, input_keyword=keyword))
             if result:
-                self.root.after(0, lambda: self._log(f"[单地址] {keyword} -> {result['lng']},{result['lat']} ({result.get('address','')})"))
+                sim = address_similarity(keyword, result)
+                warn = " [相似度低]" if sim < 0.4 else ""
+                self.root.after(0, lambda: self._log(f"[单地址] {keyword} -> {result['lng']},{result['lat']} ({result.get('address','')}){warn} (相似度:{sim:.0%})"))
             else:
                 self.root.after(0, lambda: self._log(f"[单地址] {keyword} -> 未找到"))
 
@@ -583,12 +907,14 @@ class GeoApp:
                 df['纬度'] = None
                 df['WGS84经度'] = None
                 df['WGS84纬度'] = None
+                df['坐标系'] = 'GCJ-02'
                 df['省份'] = None
                 df['城市'] = None
                 df['区县'] = None
                 df['API返回地址'] = None
                 df['匹配方式'] = None
                 df['精度'] = None
+                df['地址相似度'] = None
 
                 accurate = 0
                 low = 0
@@ -607,12 +933,16 @@ class GeoApp:
                             df.at[idx, 'WGS84经度'] = wgs_lng
                             df.at[idx, 'WGS84纬度'] = wgs_lat
                         except Exception:
-                            pass
+                            self.root.after(0, lambda i=idx: self._log(f"  [警告] 第{i+1}行 WGS-84转换失败"))
+                        # 计算地址相似度
+                        sim = address_similarity(search_kw, result)
+                        df.at[idx, '地址相似度'] = sim
                         df.at[idx, '省份'] = result.get('province', '')
                         df.at[idx, '城市'] = result.get('city', '')
                         df.at[idx, '区县'] = result.get('district', '')
                         df.at[idx, 'API返回地址'] = result.get('address', '') or result.get('name', '')
                         df.at[idx, '匹配方式'] = result.get('method', '')
+                        df.at[idx, '坐标系'] = result.get('coord_type', 'GCJ-02')
 
                         if result.get('accurate'):
                             df.at[idx, '精度'] = '精确'
@@ -622,8 +952,9 @@ class GeoApp:
                             low += 1
 
                         status = "OK" if result.get('accurate') else "LOW"
-                        self.root.after(0, lambda i=idx, t=total, s=status, r=result:
-                            self._log(f"[{i+1}/{t}] {s} {r['lng']},{r['lat']} ({r.get('address','')})"))
+                        sim_warn = " [相似度低]" if sim < 0.4 else ""
+                        self.root.after(0, lambda i=idx, t=total, s=status, r=result, sm=sim, sw=sim_warn:
+                            self._log(f"[{i+1}/{t}] {s} {r['lng']},{r['lat']} ({r.get('address','')}){sw} (相似度:{sm:.0%})"))
                     else:
                         fail += 1
                         df.at[idx, '精度'] = '失败'

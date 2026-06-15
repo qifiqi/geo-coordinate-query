@@ -49,6 +49,28 @@ def gcj02_to_wgs84(lng, lat):
     return round(wgs_lng, 6), round(wgs_lat, 6)
 
 
+def wgs84_to_gcj02(lng, lat):
+    """WGS-84 转 GCJ-02（迭代逼近法，精度 < 0.000001 度）"""
+    # 先用正向算法获取初始偏移
+    dlat = _transform_lat(lng - 105.0, lat - 35.0)
+    dlng = _transform_lng(lng - 105.0, lat - 35.0)
+    radlat = lat / 180.0 * PI
+    magic = math.sin(radlat)
+    magic = 1 - EE * magic * magic
+    sqrtmagic = math.sqrt(magic)
+    dlat = (dlat * 180.0) / ((A * (1 - EE)) / (magic * sqrtmagic) * PI)
+    dlng = (dlng * 180.0) / (A / sqrtmagic * math.cos(radlat) * PI)
+    # GCJ-02 = WGS-84 + delta
+    gcj_lng = lng + dlng
+    gcj_lat = lat + dlat
+    # 迭代修正（2次即可达到高精度）
+    for _ in range(2):
+        wgs_lng_check, wgs_lat_check = gcj02_to_wgs84(gcj_lng, gcj_lat)
+        gcj_lng += (lng - wgs_lng_check)
+        gcj_lat += (lat - wgs_lat_check)
+    return round(gcj_lng, 6), round(gcj_lat, 6)
+
+
 def convert_excel(input_path, output_path=None):
     """转换Excel文件中的GCJ-02坐标为WGS-84"""
     if output_path is None:
