@@ -22,5 +22,10 @@ Thumbs.db
 # Logs
 *.log
 
+_release.py
+.json
+.txt
+.spec
+
 .csv
 .xlsx
