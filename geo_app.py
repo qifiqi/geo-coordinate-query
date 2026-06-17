@@ -12,7 +12,7 @@ import os
 import sys
 import json
 from urllib.parse import quote
-from convert_to_wgs84 import gcj02_to_wgs84, wgs84_to_gcj02
+from convert_to_wgs84 import gcj02_to_wgs84, wgs84_to_gcj02, bd09_to_gcj02, gcj02_to_bd09
 
 # ========== 配置管理 ==========
 
@@ -35,7 +35,7 @@ def load_config():
                 return json.load(f)
         except:
             pass
-    return {'api_key': ''}
+    return {'api_key': '', 'baidu_ak': ''}
 
 def save_config(config):
     """保存配置文件"""
@@ -47,6 +47,9 @@ _config = load_config()
 
 def get_api_key():
     return _config.get('api_key', '')
+
+def get_baidu_ak():
+    return _config.get('baidu_ak', '')
 
 # ========== API查询函数 ==========
 
@@ -123,6 +126,101 @@ def smart_search(keyword):
             return result
 
     result = poi_search(keyword)
+    if result:
+        candidates.append(result)
+        if result['accurate']:
+            return result
+
+    return candidates[0] if candidates else None
+
+# ========== 百度地图API查询函数 ==========
+
+def baidu_geocode_search(keyword, ak=None):
+    """百度地图地理编码搜索"""
+    key = ak or get_baidu_ak()
+    if not key:
+        return None
+    encoded = quote(keyword.strip())
+    url = f"https://api.map.baidu.com/geocoding/v3/?address={encoded}&ak={key}&output=json"
+    try:
+        resp = requests.get(url, timeout=10)
+        data = resp.json()
+        if data.get('status') == 0 and data.get('result'):
+            result = data['result']
+            location = result.get('location', {})
+            lng = location.get('lng', 0)
+            lat = location.get('lat', 0)
+            # 百度返回BD-09坐标，转换为GCJ-02
+            gcj_lng, gcj_lat = bd09_to_gcj02(lng, lat)
+            confidence = result.get('confidence', 0)
+            level = result.get('level', '')
+            is_accurate = confidence >= 50 and level not in ['城市', '区县', '乡镇']
+            return {
+                'lng': gcj_lng, 'lat': gcj_lat,
+                'bd_lng': lng, 'bd_lat': lat,
+                'province': '', 'city': '', 'district': '',
+                'address': keyword.strip(),
+                'confidence': confidence, 'level': level,
+                'accurate': is_accurate, 'method': '百度geocode',
+                'coord_type': 'GCJ-02(由BD-09转换)'
+            }
+    except Exception:
+        pass
+    return None
+
+def baidu_poi_search(keyword, city='', ak=None):
+    """百度地图POI搜索"""
+    key = ak or get_baidu_ak()
+    if not key:
+        return None
+    encoded = quote(keyword.strip())
+    encoded_city = quote(city) if city else ''
+    url = f"https://api.map.baidu.com/place/v2/search?query={encoded}&region={encoded_city}&ak={key}&output=json&page_size=3"
+    try:
+        resp = requests.get(url, timeout=10)
+        data = resp.json()
+        if data.get('status') == 0 and data.get('results') and len(data['results']) > 0:
+            poi = data['results'][0]
+            location = poi.get('location', {})
+            lng = location.get('lng', 0)
+            lat = location.get('lat', 0)
+            # 百度返回BD-09坐标，转换为GCJ-02
+            gcj_lng, gcj_lat = bd09_to_gcj02(lng, lat)
+            province = poi.get('province', '')
+            city_name = poi.get('city', '')
+            area = poi.get('area', '')
+            address = poi.get('address', '')
+            name = poi.get('name', '')
+            overall_rating = poi.get('overall_rating', '')
+            return {
+                'lng': gcj_lng, 'lat': gcj_lat,
+                'bd_lng': lng, 'bd_lat': lat,
+                'province': province, 'city': city_name, 'district': area,
+                'address': address, 'name': name,
+                'tel': poi.get('telephone', ''),
+                'type': poi.get('tag', ''),
+                'rating': overall_rating,
+                'accurate': True, 'method': '百度POI',
+                'coord_type': 'GCJ-02(由BD-09转换)'
+            }
+    except Exception:
+        pass
+    return None
+
+def baidu_smart_search(keyword):
+    """百度地图多策略智能搜索"""
+    if not keyword or not keyword.strip():
+        return None
+    keyword = keyword.strip()
+    candidates = []
+
+    result = baidu_geocode_search(keyword)
+    if result:
+        candidates.append(result)
+        if result['accurate']:
+            return result
+
+    result = baidu_poi_search(keyword)
     if result:
         candidates.append(result)
         if result['accurate']:
@@ -317,6 +415,11 @@ class GeoApp:
         convert_tab = ttk.Frame(self.notebook, padding=12)
         self.notebook.add(convert_tab, text="  坐标转换工具  ")
         self._build_convert_tab(convert_tab)
+
+        # 百度查询标签页
+        baidu_tab = ttk.Frame(self.notebook, padding=12)
+        self.notebook.add(baidu_tab, text="  百度查询  ")
+        self._build_baidu_tab(baidu_tab)
 
         # Tab 2: 设置
         settings_tab = ttk.Frame(self.notebook, padding=12)
@@ -628,13 +731,333 @@ class GeoApp:
 
         threading.Thread(target=task, daemon=True).start()
 
+    # ===== 百度查询选项卡 =====
+    def _build_baidu_tab(self, parent):
+        # AK状态提示
+        self.baidu_ak_status = ttk.Label(parent, text="", style='KeyNo.TLabel')
+        self.baidu_ak_status.pack(pady=(0, 5))
+        self._update_baidu_ak_status()
+
+        # 单地址查询
+        addr_frame = ttk.LabelFrame(parent, text="  百度地图 - 单地址查询  ", padding=10)
+        addr_frame.pack(fill='x', pady=(0, 6))
+
+        input_row = ttk.Frame(addr_frame)
+        input_row.pack(fill='x')
+        ttk.Label(input_row, text="地址/建筑名:", style='Section.TLabel').pack(side='left')
+        self.baidu_addr_entry = ttk.Entry(input_row, width=45, font=('微软雅黑', 10))
+        self.baidu_addr_entry.pack(side='left', padx=(5, 8), fill='x', expand=True)
+        self.baidu_addr_entry.bind('<Return>', lambda e: self._do_baidu_single())
+        ttk.Button(input_row, text="查询", style='Accent.TButton', command=self._do_baidu_single).pack(side='right')
+
+        # 结果显示
+        self.baidu_result_frame = ttk.Frame(addr_frame)
+        self.baidu_result_frame.pack(fill='x', pady=(8, 0))
+        self.baidu_result_labels = {}
+        fields = [
+            ('status', '状态'), ('method', '匹配方式'),
+            ('lng', '经度(GCJ-02)'), ('lat', '纬度(GCJ-02)'),
+            ('bd_lng', '百度经度(BD-09)'), ('bd_lat', '百度纬度(BD-09)'),
+            ('wgs_lng', 'WGS-84经度'), ('wgs_lat', 'WGS-84纬度'),
+            ('similarity', '地址相似度'), ('coord_type', '坐标系'),
+            ('province', '省份'), ('city', '城市'), ('district', '区县'),
+            ('address', '地址'), ('name', 'POI名称'), ('type', '类型')
+        ]
+        for i, (key, label) in enumerate(fields):
+            row = i // 2
+            col = (i % 2) * 3
+            is_row_bg = (row % 2 == 0)
+            field_style = 'FieldLabelRow.TLabel' if is_row_bg else 'FieldLabel.TLabel'
+            val_style = 'ResultRow.TLabel' if is_row_bg else 'Result.TLabel'
+            ttk.Label(self.baidu_result_frame, text=f"  {label}  ", style=field_style).grid(row=row, column=col, sticky='e', padx=(0, 2), pady=1)
+            lbl = ttk.Label(self.baidu_result_frame, text="—", style=val_style, anchor='w', width=24, cursor='hand2')
+            lbl.grid(row=row, column=col+1, sticky='w', padx=(0, 2), pady=1)
+            lbl.bind('<Button-1>', lambda e, k=key: self._copy_baidu_label(k))
+            lbl.bind('<Enter>', lambda e, l=lbl: l.configure(foreground='#1565c0'))
+            lbl.bind('<Leave>', lambda e, l=lbl, s=val_style: l.configure(foreground=ttk.Style().lookup(s, 'foreground')))
+            self.baidu_result_labels[key] = lbl
+
+        # 批量Excel处理
+        excel_frame = ttk.LabelFrame(parent, text="  百度地图 - 批量Excel处理  ", padding=10)
+        excel_frame.pack(fill='x', pady=(0, 6))
+
+        file_row = ttk.Frame(excel_frame)
+        file_row.pack(fill='x')
+        ttk.Label(file_row, text="Excel文件:", style='Section.TLabel').pack(side='left')
+        self.baidu_file_var = tk.StringVar()
+        ttk.Entry(file_row, textvariable=self.baidu_file_var, width=40, font=('微软雅黑', 9), state='readonly').pack(side='left', padx=(5, 8), fill='x', expand=True)
+        ttk.Button(file_row, text="选择文件", command=self._pick_baidu_file).pack(side='right')
+
+        btn_row = ttk.Frame(excel_frame)
+        btn_row.pack(fill='x', pady=(8, 0))
+        self.baidu_batch_btn = ttk.Button(btn_row, text="开始批量处理", style='Accent.TButton', command=self._do_baidu_batch)
+        self.baidu_batch_btn.pack(side='left')
+        self.baidu_batch_status = ttk.Label(btn_row, text="", style='Info.TLabel')
+        self.baidu_batch_status.pack(side='left', padx=10)
+
+        # 进度条和日志
+        self.baidu_progress = ttk.Progressbar(parent, length=650, mode='determinate')
+        self.baidu_progress.pack(fill='x', pady=(0, 4))
+
+        log_frame = ttk.LabelFrame(parent, text="  百度查询日志  ", padding=5)
+        log_frame.pack(fill='both', expand=True)
+        self.baidu_log_text = tk.Text(log_frame, height=7, font=('Consolas', 8), state='disabled', wrap='word')
+        scrollbar = ttk.Scrollbar(log_frame, orient='vertical', command=self.baidu_log_text.yview)
+        self.baidu_log_text.configure(yscrollcommand=scrollbar.set)
+        self.baidu_log_text.pack(side='left', fill='both', expand=True)
+        scrollbar.pack(side='right', fill='y')
+
+        # 使用说明
+        guide_frame = ttk.LabelFrame(parent, text="  使用说明  ", padding=8)
+        guide_frame.pack(fill='x', pady=(6, 0))
+        guide_text = (
+            "• 百度地图API返回BD-09坐标系，已自动转换为GCJ-02（与高德一致）和WGS-84\n"
+            "• 百度地图POI数据丰富，适合地标建筑、商铺、景点等查询\n"
+            "• 需要先在「设置」选项卡配置百度地图AK（免费申请）"
+        )
+        ttk.Label(guide_frame, text=guide_text, style='Step.TLabel', justify='left').pack(anchor='w')
+
+    def _update_baidu_ak_status(self):
+        ak = get_baidu_ak()
+        if ak:
+            self.baidu_ak_status.pack_forget()
+        else:
+            self.baidu_ak_status.configure(text="未设置百度地图 AK，请前往「设置」选项卡配置！", style='KeyNo.TLabel')
+            self.baidu_ak_status.pack(pady=(0, 5))
+
+    def _set_baidu_result(self, data, input_keyword=''):
+        for key, lbl in self.baidu_result_labels.items():
+            lbl.configure(text="—")
+        if data is None:
+            self.baidu_result_labels['status'].configure(text="未找到")
+            return
+        if data.get('accurate'):
+            self.baidu_result_labels['status'].configure(text="  查询成功  ")
+        else:
+            self.baidu_result_labels['status'].configure(text="  精度较低  ")
+        self.baidu_result_labels['method'].configure(text=f"  {data.get('method', '—')}  ")
+        self.baidu_result_labels['coord_type'].configure(text=f"  {data.get('coord_type', 'BD-09')}  ")
+        lng = data.get('lng', '—')
+        lat = data.get('lat', '—')
+        self.baidu_result_labels['lng'].configure(text=str(lng))
+        self.baidu_result_labels['lat'].configure(text=str(lat))
+        bd_lng = data.get('bd_lng', '—')
+        bd_lat = data.get('bd_lat', '—')
+        self.baidu_result_labels['bd_lng'].configure(text=str(bd_lng))
+        self.baidu_result_labels['bd_lat'].configure(text=str(bd_lat))
+        # 计算WGS-84
+        if lng != '—' and lat != '—':
+            try:
+                wgs_lng, wgs_lat = gcj02_to_wgs84(float(lng), float(lat))
+                self.baidu_result_labels['wgs_lng'].configure(text=str(wgs_lng))
+                self.baidu_result_labels['wgs_lat'].configure(text=str(wgs_lat))
+            except Exception:
+                self.baidu_result_labels['wgs_lng'].configure(text='转换失败')
+                self.baidu_result_labels['wgs_lat'].configure(text='转换失败')
+        # 地址相似度
+        sim = address_similarity(input_keyword, data) if input_keyword else 0.0
+        sim_lbl = self.baidu_result_labels.get('similarity')
+        if sim_lbl:
+            sim_text = f"{sim:.0%}" if sim > 0 else "—"
+            sim_lbl.configure(text=f"  {sim_text}  ")
+            if sim >= 0.6:
+                sim_lbl.configure(style='SimHigh.TLabel')
+            elif sim >= 0.4:
+                sim_lbl.configure(style='SimMid.TLabel')
+            else:
+                sim_lbl.configure(style='SimLow.TLabel')
+        self.baidu_result_labels['province'].configure(text=data.get('province', '—'))
+        self.baidu_result_labels['city'].configure(text=data.get('city', '—'))
+        self.baidu_result_labels['district'].configure(text=data.get('district', '—'))
+        self.baidu_result_labels['address'].configure(text=data.get('address', '—'))
+        self.baidu_result_labels['name'].configure(text=data.get('name', '—'))
+        self.baidu_result_labels['type'].configure(text=data.get('type', '—'))
+
+    def _copy_baidu_label(self, key):
+        text = self.baidu_result_labels[key].cget('text')
+        if not text or text == '—':
+            return
+        text = text.strip()
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        self._show_copy_tooltip(key, text)
+
+    def _check_baidu_ak(self):
+        if not get_baidu_ak():
+            messagebox.showwarning("提示", "请先在「设置」选项卡中配置百度地图 AK！")
+            self.notebook.select(3)  # 切换到设置tab
+            return False
+        return True
+
+    def _pick_baidu_file(self):
+        path = filedialog.askopenfilename(
+            title="选择Excel文件",
+            filetypes=[("Excel文件", "*.xlsx *.xls")],
+            initialdir=_get_app_dir()
+        )
+        if path:
+            self.baidu_file_var.set(path)
+
+    def _baidu_log(self, msg):
+        self.baidu_log_text.configure(state='normal')
+        self.baidu_log_text.insert('end', msg + '\n')
+        self.baidu_log_text.see('end')
+        self.baidu_log_text.configure(state='disabled')
+        self.root.update_idletasks()
+
+    def _do_baidu_single(self):
+        if not self._check_baidu_ak():
+            return
+        keyword = self.baidu_addr_entry.get().strip()
+        if not keyword:
+            messagebox.showwarning("提示", "请输入地址或建筑名称")
+            return
+        self._set_baidu_result(None)
+        self.baidu_result_labels['status'].configure(text="查询中...")
+        self.root.update_idletasks()
+
+        def task():
+            result = baidu_smart_search(keyword)
+            self.root.after(0, lambda: self._set_baidu_result(result, input_keyword=keyword))
+            if result:
+                sim = address_similarity(keyword, result)
+                warn = " [相似度低]" if sim < 0.4 else ""
+                self.root.after(0, lambda: self._baidu_log(
+                    f"[百度单地址] {keyword} -> {result['lng']},{result['lat']} ({result.get('address','')}){warn} (相似度:{sim:.0%})"))
+            else:
+                self.root.after(0, lambda: self._baidu_log(f"[百度单地址] {keyword} -> 未找到"))
+
+        threading.Thread(target=task, daemon=True).start()
+
+    def _do_baidu_batch(self):
+        if not self._check_baidu_ak():
+            return
+        file_path = self.baidu_file_var.get().strip()
+        if not file_path or not os.path.exists(file_path):
+            messagebox.showwarning("提示", "请先选择有效的Excel文件")
+            return
+        self.baidu_batch_btn.configure(state='disabled')
+        self.baidu_progress['value'] = 0
+
+        def task():
+            try:
+                df = pd.read_excel(file_path)
+                total = len(df)
+                self.root.after(0, lambda: self._baidu_log(f"读取文件: {os.path.basename(file_path)}，共{total}行"))
+
+                df['经度'] = None
+                df['纬度'] = None
+                df['WGS84经度'] = None
+                df['WGS84纬度'] = None
+                df['坐标系'] = 'GCJ-02(由BD-09转换)'
+                df['省份'] = None
+                df['城市'] = None
+                df['区县'] = None
+                df['API返回地址'] = None
+                df['匹配方式'] = None
+                df['精度'] = None
+                df['地址相似度'] = None
+
+                accurate = 0
+                low = 0
+                fail = 0
+
+                for idx, row in df.iterrows():
+                    search_kw = build_search_address(row)
+                    result = baidu_smart_search(search_kw)
+
+                    if result:
+                        df.at[idx, '经度'] = result['lng']
+                        df.at[idx, '纬度'] = result['lat']
+                        try:
+                            wgs_lng, wgs_lat = gcj02_to_wgs84(float(result['lng']), float(result['lat']))
+                            df.at[idx, 'WGS84经度'] = wgs_lng
+                            df.at[idx, 'WGS84纬度'] = wgs_lat
+                        except Exception:
+                            self.root.after(0, lambda i=idx: self._baidu_log(f"  [警告] 第{i+1}行 WGS-84转换失败"))
+                        sim = address_similarity(search_kw, result)
+                        df.at[idx, '地址相似度'] = sim
+                        df.at[idx, '省份'] = result.get('province', '')
+                        df.at[idx, '城市'] = result.get('city', '')
+                        df.at[idx, '区县'] = result.get('district', '')
+                        df.at[idx, 'API返回地址'] = result.get('address', '') or result.get('name', '')
+                        df.at[idx, '匹配方式'] = result.get('method', '')
+                        df.at[idx, '坐标系'] = result.get('coord_type', 'GCJ-02(由BD-09转换)')
+
+                        if result.get('accurate'):
+                            df.at[idx, '精度'] = '精确'
+                            accurate += 1
+                        else:
+                            df.at[idx, '精度'] = '粗略'
+                            low += 1
+
+                        status = "OK" if result.get('accurate') else "LOW"
+                        sim_warn = " [相似度低]" if sim < 0.4 else ""
+                        self.root.after(0, lambda i=idx, t=total, s=status, r=result, sm=sim, sw=sim_warn:
+                            self._baidu_log(f"[{i+1}/{t}] {s} {r['lng']},{r['lat']} ({r.get('address','')}){sw} (相似度:{sm:.0%})"))
+                    else:
+                        fail += 1
+                        df.at[idx, '精度'] = '失败'
+                        self.root.after(0, lambda i=idx, t=total:
+                            self._baidu_log(f"[{i+1}/{t}] FAIL"))
+
+                    pct = (idx + 1) / total * 100
+                    self.root.after(0, lambda p=pct: self.baidu_progress.configure(value=p))
+                    self.root.after(0, lambda i=idx, t=total: self.baidu_batch_status.configure(text=f"处理中 {i+1}/{t}"))
+                    time.sleep(0.15)
+
+                dir_path = os.path.dirname(file_path)
+                base_name = os.path.splitext(os.path.basename(file_path))[0]
+                output_file = os.path.join(dir_path, f"{base_name}_百度经纬度.xlsx")
+                df.to_excel(output_file, index=False, engine='openpyxl')
+
+                summary = f"完成! 精确:{accurate} 粗略:{low} 失败:{fail} 共:{total}"
+                self.root.after(0, lambda: self._baidu_log(summary))
+                self.root.after(0, lambda: self.baidu_batch_status.configure(text=summary))
+                self.root.after(0, lambda: messagebox.showinfo("处理完成",
+                    f"结果已保存到:\n{output_file}\n\n精确匹配: {accurate}\n粗略匹配: {low}\n失败: {fail}"))
+
+            except Exception as e:
+                self.root.after(0, lambda: messagebox.showerror("错误", f"处理失败:\n{str(e)}"))
+                self.root.after(0, lambda: self._baidu_log(f"错误: {str(e)}"))
+            finally:
+                self.root.after(0, lambda: self.baidu_batch_btn.configure(state='normal'))
+
+        threading.Thread(target=task, daemon=True).start()
+
     # ===== 设置选项卡 =====
     def _build_settings_tab(self, parent):
-        # 标题
-        ttk.Label(parent, text="API Key 设置", style='Title.TLabel').pack(pady=(0, 10))
+        # 创建可滚动区域
+        canvas = tk.Canvas(parent, highlightthickness=0, bg='#fafafa')
+        scrollbar = ttk.Scrollbar(parent, orient='vertical', command=canvas.yview)
+        scroll_frame = ttk.Frame(canvas, padding=4)
 
-        # Key输入区域
-        key_frame = ttk.LabelFrame(parent, text="  高德地图 API Key  ", padding=12)
+        scroll_frame.bind('<Configure>', lambda e: canvas.configure(scrollregion=canvas.bbox('all')))
+        _canvas_win = canvas.create_window((0, 0), window=scroll_frame, anchor='nw')
+        canvas.configure(yscrollcommand=scrollbar.set)
+        # 内部Frame宽度跟随Canvas
+        def _on_canvas_resize(event):
+            canvas.itemconfig(_canvas_win, width=event.width)
+        canvas.bind('<Configure>', _on_canvas_resize)
+
+        canvas.pack(side='left', fill='both', expand=True)
+        scrollbar.pack(side='right', fill='y')
+
+        # 鼠标滚轮支持（仅在Canvas区域内生效）
+        def _on_mousewheel(event):
+            canvas.yview_scroll(int(-1 * (event.delta / 120)), 'units')
+        def _bind_mousewheel(event):
+            canvas.bind_all('<MouseWheel>', _on_mousewheel)
+        def _unbind_mousewheel(event):
+            canvas.unbind_all('<MouseWheel>')
+        canvas.bind('<Enter>', _bind_mousewheel)
+        canvas.bind('<Leave>', _unbind_mousewheel)
+
+        # 标题
+        ttk.Label(scroll_frame, text="API Key 设置", style='Title.TLabel').pack(pady=(0, 10))
+
+        # 高德Key输入区域
+        key_frame = ttk.LabelFrame(scroll_frame, text="  高德地图 API Key  ", padding=12)
         key_frame.pack(fill='x', pady=(0, 10))
 
         input_row = ttk.Frame(key_frame)
@@ -642,7 +1065,6 @@ class GeoApp:
         ttk.Label(input_row, text="API Key:", style='Section.TLabel').pack(side='left')
         self.key_entry = ttk.Entry(input_row, width=50, font=('Consolas', 10))
         self.key_entry.pack(side='left', padx=(5, 8), fill='x', expand=True)
-        # 加载已保存的key
         self.key_entry.insert(0, get_api_key())
 
         save_btn = ttk.Button(input_row, text="保存", style='Accent.TButton', command=self._save_key)
@@ -651,16 +1073,15 @@ class GeoApp:
         self.key_save_status = ttk.Label(key_frame, text="", style='Info.TLabel')
         self.key_save_status.pack(pady=(5, 0))
 
-        # 测试按钮
         test_row = ttk.Frame(key_frame)
         test_row.pack(fill='x', pady=(8, 0))
         ttk.Button(test_row, text="测试 Key 是否可用", command=self._test_key).pack(side='left')
         self.test_result_label = ttk.Label(test_row, text="", style='Info.TLabel')
         self.test_result_label.pack(side='left', padx=10)
 
-        # 创建说明
-        guide_frame = ttk.LabelFrame(parent, text="  如何获取高德地图 API Key（免费）  ", padding=12)
-        guide_frame.pack(fill='both', expand=True)
+        # 高德创建说明
+        guide_frame = ttk.LabelFrame(scroll_frame, text="  如何获取高德地图 API Key（免费）  ", padding=12)
+        guide_frame.pack(fill='x', pady=(0, 10))
 
         steps = [
             ("步骤 1：注册账号",
@@ -687,11 +1108,9 @@ class GeoApp:
         for i, (title, desc) in enumerate(steps):
             step_frame = ttk.Frame(guide_frame)
             step_frame.pack(fill='x', pady=(0 if i == 0 else 8, 0))
-
             ttk.Label(step_frame, text=title, style='Section.TLabel').pack(anchor='w')
             ttk.Label(step_frame, text=desc, style='Step.TLabel').pack(anchor='w', padx=(10, 0))
 
-        # 底部链接
         link_frame = ttk.Frame(guide_frame)
         link_frame.pack(fill='x', pady=(12, 0))
         link_label = ttk.Label(link_frame, text="打开高德开放平台: https://lbs.amap.com/dev/key/app", style='Link.TLabel')
@@ -699,9 +1118,63 @@ class GeoApp:
         link_label.bind('<Button-1>', lambda e: self._open_url("https://lbs.amap.com/dev/key/app"))
         link_label.configure(cursor='hand2')
 
+        # ============ 百度地图 AK 设置 ============
+        baidu_frame = ttk.LabelFrame(scroll_frame, text="  百度地图 AK (Access Key)  ", padding=12)
+        baidu_frame.pack(fill='x', pady=(0, 10))
+
+        baidu_input_row = ttk.Frame(baidu_frame)
+        baidu_input_row.pack(fill='x')
+        ttk.Label(baidu_input_row, text="百度 AK:", style='Section.TLabel').pack(side='left')
+        self.baidu_ak_entry = ttk.Entry(baidu_input_row, width=50, font=('Consolas', 10))
+        self.baidu_ak_entry.pack(side='left', padx=(5, 8), fill='x', expand=True)
+        self.baidu_ak_entry.insert(0, get_baidu_ak())
+
+        baidu_save_btn = ttk.Button(baidu_input_row, text="保存", style='Accent.TButton', command=self._save_baidu_ak)
+        baidu_save_btn.pack(side='right')
+
+        self.baidu_ak_save_status = ttk.Label(baidu_frame, text="", style='Info.TLabel')
+        self.baidu_ak_save_status.pack(pady=(5, 0))
+
+        baidu_test_row = ttk.Frame(baidu_frame)
+        baidu_test_row.pack(fill='x', pady=(8, 0))
+        ttk.Button(baidu_test_row, text="测试 AK 是否可用", command=self._test_baidu_ak).pack(side='left')
+        self.baidu_test_result_label = ttk.Label(baidu_test_row, text="", style='Info.TLabel')
+        self.baidu_test_result_label.pack(side='left', padx=10)
+
+        # 百度创建说明
+        baidu_guide = ttk.LabelFrame(scroll_frame, text="  如何获取百度地图 AK（免费）  ", padding=12)
+        baidu_guide.pack(fill='x', pady=(0, 6))
+
+        baidu_steps = [
+            ("步骤 1：注册账号",
+             "打开百度地图开放平台：https://lbsyun.baidu.com/\n"
+             "点击右上角「注册」，使用手机号完成注册。"),
+            ("步骤 2：创建应用",
+             "登录后进入「控制台」->「应用管理」->「我的应用」\n"
+             "点击「创建应用」，应用名称随意，应用类型选「其他」。"),
+            ("步骤 3：获取 AK",
+             "在应用下方点击「添加 Key」，应用类型选「服务端」，\n"
+             "提交后即可获得 AK。"),
+            ("步骤 4：使用 AK",
+             "将 AK 粘贴到上方输入框，点击「保存」即可。\n"
+             "免费额度：每日 30,000 次地理编码调用，足够日常使用。"),
+        ]
+        for i, (title, desc) in enumerate(baidu_steps):
+            step_frame = ttk.Frame(baidu_guide)
+            step_frame.pack(fill='x', pady=(0 if i == 0 else 8, 0))
+            ttk.Label(step_frame, text=title, style='Section.TLabel').pack(anchor='w')
+            ttk.Label(step_frame, text=desc, style='Step.TLabel').pack(anchor='w', padx=(10, 0))
+
+        baidu_link_frame = ttk.Frame(baidu_guide)
+        baidu_link_frame.pack(fill='x', pady=(12, 0))
+        baidu_link_label = ttk.Label(baidu_link_frame, text="打开百度地图开放平台: https://lbsyun.baidu.com/apiconsole/key", style='Link.TLabel')
+        baidu_link_label.pack(anchor='w')
+        baidu_link_label.bind('<Button-1>', lambda e: self._open_url("https://lbsyun.baidu.com/apiconsole/key"))
+        baidu_link_label.configure(cursor='hand2')
+
         # 底部说明
-        ttk.Label(guide_frame, text="提示：Key 保存在程序同目录下的 config.json 文件中，修改后自动生效。",
-                  style='Tip.TLabel').pack(anchor='w', pady=(10, 0))
+        ttk.Label(scroll_frame, text="提示：Key 保存在程序同目录下的 config.json 文件中，修改后自动生效。",
+                  style='Tip.TLabel').pack(anchor='w', pady=(6, 0))
 
     def _update_key_status(self):
         key = get_api_key()
@@ -755,6 +1228,44 @@ class GeoApp:
     def _open_url(self, url):
         import webbrowser
         webbrowser.open(url)
+
+    def _save_baidu_ak(self):
+        global _config
+        new_ak = self.baidu_ak_entry.get().strip()
+        if not new_ak:
+            messagebox.showwarning("提示", "请输入百度地图 AK")
+            return
+        _config['baidu_ak'] = new_ak
+        save_config(_config)
+        self.baidu_ak_save_status.configure(text="已保存!")
+        self._update_baidu_ak_status()
+        self.root.after(2000, lambda: self.baidu_ak_save_status.configure(text=""))
+
+    def _test_baidu_ak(self):
+        ak = self.baidu_ak_entry.get().strip()
+        if not ak:
+            messagebox.showwarning("提示", "请先输入百度地图 AK")
+            return
+        self.baidu_test_result_label.configure(text="测试中...")
+        self.root.update_idletasks()
+
+        def task():
+            url = f"https://api.map.baidu.com/geocoding/v3/?address=%E5%8C%97%E4%BA%AC&ak={ak}&output=json"
+            try:
+                resp = requests.get(url, timeout=10)
+                data = resp.json()
+                if data.get('status') == 0:
+                    self.root.after(0, lambda: self.baidu_test_result_label.configure(
+                        text="AK 有效!", foreground='#27ae60'))
+                else:
+                    msg = data.get('message', '未知错误')
+                    self.root.after(0, lambda: self.baidu_test_result_label.configure(
+                        text=f"AK 无效: {msg}", foreground='#e74c3c'))
+            except Exception as e:
+                self.root.after(0, lambda: self.baidu_test_result_label.configure(
+                    text=f"网络错误: {str(e)[:30]}", foreground='#e74c3c'))
+
+        threading.Thread(target=task, daemon=True).start()
 
     # ===== 查询功能 =====
     def _log(self, msg):
@@ -858,7 +1369,7 @@ class GeoApp:
     def _check_key(self):
         if not get_api_key():
             messagebox.showwarning("提示", "请先在「设置」选项卡中配置 API Key！")
-            self.notebook.select(1)  # 切换到设置tab
+            self.notebook.select(3)  # 切换到设置tab
             return False
         return True
 

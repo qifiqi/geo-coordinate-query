@@ -71,6 +71,28 @@ def wgs84_to_gcj02(lng, lat):
     return round(gcj_lng, 6), round(gcj_lat, 6)
 
 
+# ========== BD-09 <-> GCJ-02 转换算法 ==========
+
+BD_PI = math.pi * 3000.0 / 180.0
+
+def bd09_to_gcj02(bd_lng, bd_lat):
+    """BD-09 转 GCJ-02"""
+    x = bd_lng - 0.0065
+    y = bd_lat - 0.006
+    z = math.sqrt(x * x + y * y) - 0.00002 * math.sin(y * BD_PI)
+    theta = math.atan2(y, x) - 0.000003 * math.cos(x * BD_PI)
+    gcj_lng = z * math.cos(theta)
+    gcj_lat = z * math.sin(theta)
+    return round(gcj_lng, 6), round(gcj_lat, 6)
+
+def gcj02_to_bd09(gcj_lng, gcj_lat):
+    """GCJ-02 转 BD-09"""
+    z = math.sqrt(gcj_lng * gcj_lng + gcj_lat * gcj_lat) + 0.00002 * math.sin(gcj_lat * BD_PI)
+    theta = math.atan2(gcj_lat, gcj_lng) + 0.000003 * math.cos(gcj_lng * BD_PI)
+    bd_lng = z * math.cos(theta) + 0.0065
+    bd_lat = z * math.sin(theta) + 0.006
+    return round(bd_lng, 6), round(bd_lat, 6)
+
 def convert_excel(input_path, output_path=None):
     """转换Excel文件中的GCJ-02坐标为WGS-84"""
     if output_path is None:
