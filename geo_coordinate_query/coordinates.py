@@ -2,9 +2,10 @@
 GCJ-02 转 WGS-84 坐标转换脚本
 将 优秀历史建筑资料_经纬度.xlsx 中的经纬度从 GCJ-02 转换为 WGS-84
 """
+from pathlib import Path
 import math
+
 import pandas as pd
-import os
 
 # ========== GCJ-02 -> WGS-84 转换算法 ==========
 
@@ -96,8 +97,8 @@ def gcj02_to_bd09(gcj_lng, gcj_lat):
 def convert_excel(input_path, output_path=None):
     """转换Excel文件中的GCJ-02坐标为WGS-84"""
     if output_path is None:
-        base, ext = os.path.splitext(input_path)
-        output_path = f"{base}_WGS84{ext}"
+        input_file = Path(input_path)
+        output_path = str(input_file.with_name(f"{input_file.stem}_WGS84{input_file.suffix}"))
 
     df = pd.read_excel(input_path)
     print(f"读取文件: {input_path}，共 {len(df)} 条记录")
@@ -130,11 +131,3 @@ def convert_excel(input_path, output_path=None):
     print(f"结果已保存到: {output_path}")
     return output_path
 
-
-if __name__ == "__main__":
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    input_file = os.path.join(script_dir, "优秀历史建筑资料_经纬度.xlsx")
-    if os.path.exists(input_file):
-        convert_excel(input_file)
-    else:
-        print(f"文件不存在: {input_file}")

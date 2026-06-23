@@ -1,262 +1,239 @@
-import pandas as pd
-import requests
-import time
-from urllib.parse import quote
+"""Command-line interface for geocoding and coordinate conversion."""
 
-# 高德地图API配置
-gao_de_api_key = '9ae99783bce390962a1795e54ced3c07'
+from __future__ import annotations
 
-# 读取Excel文件
-def read_excel_file(file_path):
-    try:
-        df = pd.read_excel(file_path)
-        print(f"成功读取Excel文件，共{len(df)}行数据")
-        print(f"列名: {list(df.columns)}")
-        return df
-    except Exception as e:
-        print(f"读取Excel文件失败: {e}")
-        return None
+import argparse
+import json
+from pathlib import Path
+import sys
+from typing import Any
 
-# ========== 多种查询策略 ==========
+from geo_coordinate_query.baidu_excel_processor import process_baidu_excel
+from geo_coordinate_query.batch_convert import convert_coordinate_excel
+from geo_coordinate_query.config import get_api_key, get_baidu_ak, get_config, update_config
+from geo_coordinate_query.coordinates import gcj02_to_wgs84, wgs84_to_gcj02
+from geo_coordinate_query.excel_processor import process_amap_excel
+from geo_coordinate_query.map_services import baidu_smart_search, smart_search
+from geo_coordinate_query.matching import address_similarity
 
-# 策略1: geocode地理编码（地址 -> 坐标）
-def geocode_search(keyword):
-    encoded = quote(keyword.strip())
-    url = f"https://restapi.amap.com/v3/geocode/geo?address={encoded}&key={gao_de_api_key}"
-    try:
-        resp = requests.get(url, timeout=10)
-        data = resp.json()
-        if data.get('status') == '1' and data.get('count') != '0':
-            geo = data['geocodes'][0]
-            lng, lat = geo['location'].split(',')
-            district = geo.get('district', '')
-            city = geo.get('city', '')
-            formatted = geo.get('formatted_address', '')
-            detail = f"{city}{district} - {formatted}"
-            # 判断精度：有district说明至少匹配到区级，否则只是城市中心点
-            is_accurate = bool(district)
-            return float(lng), float(lat), detail, is_accurate, "geocode"
-    except:
-        pass
-    return None, None, None, False, "geocode"
+Provider = str
 
-# 策略2: POI搜索（名称关键词搜索，适合地标建筑）
-def poi_search(keyword, city='武汉'):
-    encoded = quote(keyword.strip())
-    encoded_city = quote(city)
-    url = f"https://restapi.amap.com/v3/place/text?keywords={encoded}&city={encoded_city}&key={gao_de_api_key}&offset=1"
-    try:
-        resp = requests.get(url, timeout=10)
-        data = resp.json()
-        if data.get('status') == '1' and int(data.get('count', 0)) > 0:
-            poi = data['pois'][0]
-            lng, lat = poi['location'].split(',')
-            name = poi.get('name', '')
-            address = poi.get('address', '')
-            district = poi.get('adname', '')
-            city_name = poi.get('cityname', '')
-            detail = f"{city_name}{district} - {name}({address}) [POI]"
-            is_accurate = True  # POI匹配通常较准
-            return float(lng), float(lat), detail, is_accurate, "POI"
-    except:
-        pass
-    return None, None, None, False, "POI"
 
-# 策略3: 输入提示 + 地理编码（先补全地址再编码）
-def inputtip_geocode(keyword, city='武汉'):
-    encoded = quote(keyword.strip())
-    encoded_city = quote(city)
-    url = f"https://restapi.amap.com/v3/assistant/inputtips?keywords={encoded}&city={encoded_city}&key={gao_de_api_key}&datatype=poi"
-    try:
-        resp = requests.get(url, timeout=10)
-        data = resp.json()
-        if data.get('status') == '1' and len(data.get('tips', [])) > 0:
-            tip = data['tips'][0]
-            tip_id = tip.get('id', '')
-            if tip_id:
-                # 用ID直接查POI详情
-                detail_url = f"https://restapi.amap.com/v3/place/detail?id={tip_id}&key={gao_de_api_key}"
-                resp2 = requests.get(detail_url, timeout=10)
-                data2 = resp2.json()
-                if data2.get('status') == '1' and int(data2.get('count', 0)) > 0:
-                    poi = data2['pois'][0]
-                    lng, lat = poi['location'].split(',')
-                    name = poi.get('name', '')
-                    address = poi.get('address', '')
-                    district = poi.get('adname', '')
-                    city_name = poi.get('cityname', '')
-                    detail = f"{city_name}{district} - {name}({address}) [提示]"
-                    return float(lng), float(lat), detail, True, "输入提示"
-    except:
-        pass
-    return None, None, None, False, "输入提示"
+def _print_json(data: Any) -> None:
+    print(json.dumps(data, ensure_ascii=False, indent=2))
 
-# ========== 多策略查询主函数 ==========
 
-def smart_search(row):
-    """多策略搜索，优先保证精度"""
-    address = str(row.get('地址', '')).strip() if pd.notna(row.get('地址')) else ''
-    name = str(row.get('名称', '')).strip() if pd.notna(row.get('名称')) else ''
-    old_name = str(row.get('原名称', '')).strip() if pd.notna(row.get('原名称')) else ''
+def _summary_to_dict(summary: Any) -> dict[str, Any]:
+    data = summary.__dict__.copy()
+    data["output_file"] = str(data["output_file"])
+    data["message"] = summary.message
+    return data
 
-    candidates = []  # (lng, lat, detail, is_accurate, method, search_keyword)
 
-    # === 第一轮：geocode 地址搜索 ===
-    if address and len(address) > 3:
-        lng, lat, detail, accurate, method = geocode_search(address)
-        if lng:
-            candidates.append((lng, lat, detail, accurate, method, address))
-            if accurate:
-                return candidates[-1]  # 精确匹配，直接返回
+def _require_file(path: Path) -> None:
+    if not path.exists():
+        raise FileNotFoundError(f"文件不存在: {path}")
+    if not path.is_file():
+        raise ValueError(f"不是文件: {path}")
 
-    # === 第二轮：POI搜索（用建筑名称） ===
-    # 尝试名称
-    if name and name != 'nan' and len(name) > 2 and name not in ['居民住宅', '幼儿园']:
-        lng, lat, detail, accurate, method = poi_search(name)
-        if lng:
-            candidates.append((lng, lat, detail, accurate, method, name))
-            if accurate:
-                return candidates[-1]
 
-    # 尝试原名称（历史建筑原名可能更有辨识度）
-    if old_name and old_name != 'nan' and len(old_name) > 2:
-        lng, lat, detail, accurate, method = poi_search(old_name)
-        if lng:
-            candidates.append((lng, lat, detail, accurate, method, old_name))
-            if accurate:
-                return candidates[-1]
+def cmd_config(args: argparse.Namespace) -> int:
+    values: dict[str, str] = {}
+    if args.amap_key is not None:
+        values["api_key"] = args.amap_key.strip()
+    if args.baidu_ak is not None:
+        values["baidu_ak"] = args.baidu_ak.strip()
+    if values:
+        update_config(**values)
 
-    # === 第三轮：名称+地址组合POI搜索 ===
-    if name and address and name != 'nan':
-        combined = f"{name}({address})"
-        lng, lat, detail, accurate, method = poi_search(combined)
-        if lng:
-            candidates.append((lng, lat, detail, accurate, method, combined))
-            if accurate:
-                return candidates[-1]
+    config = get_config()
+    if args.json:
+        _print_json(
+            {
+                "amap_key_set": bool(config.get("api_key")),
+                "baidu_ak_set": bool(config.get("baidu_ak")),
+            }
+        )
+    else:
+        print(f"高德 Key: {'已配置' if get_api_key() else '未配置'}")
+        print(f"百度 AK: {'已配置' if get_baidu_ak() else '未配置'}")
+    return 0
 
-    # === 第四轮：输入提示辅助 ===
-    search_key = name if (name and name != 'nan' and name not in ['居民住宅']) else address
-    if search_key:
-        lng, lat, detail, accurate, method = inputtip_geocode(search_key)
-        if lng:
-            candidates.append((lng, lat, detail, accurate, method, search_key))
 
-    # 返回最佳结果（优先精确的，否则返回第一个有结果的）
-    for c in candidates:
-        if c[3]:  # is_accurate
-            return c
-    if candidates:
-        return candidates[0]
+def _query(provider: Provider, keyword: str) -> dict[str, Any] | None:
+    if provider == "amap":
+        return smart_search(keyword)
+    if provider == "baidu":
+        return baidu_smart_search(keyword)
+    raise ValueError(f"不支持的地图服务: {provider}")
 
-    return (None, None, None, False, "无结果", "")
 
-# ========== 批量处理 ==========
-
-def process_addresses(df):
-    df['经度'] = None
-    df['纬度'] = None
-    df['API返回地址'] = None
-    df['匹配方式'] = None
-    df['精度'] = None
-    df['状态'] = None
-    df['搜索关键词'] = None
-
-    accurate_count = 0
-    low_count = 0
-    fail_count = 0
-    start_time = time.time()
-
-    print(f"\n{'='*70}")
-    print(f"开始处理，共 {len(df)} 条记录")
-    print(f"{'='*70}\n")
-
-    for index, row in df.iterrows():
-        address = str(row.get('地址', '')).strip() if pd.notna(row.get('地址')) else ''
-        name = str(row.get('名称', '')).strip() if pd.notna(row.get('名称')) else ''
-
-        print(f"[{index + 1}/{len(df)}] {name} | {address}")
-
-        lng, lat, detail, is_accurate, method, keyword = smart_search(row)
-
-        df.at[index, '经度'] = lng
-        df.at[index, '纬度'] = lat
-        df.at[index, 'API返回地址'] = detail
-        df.at[index, '匹配方式'] = method
-        df.at[index, '搜索关键词'] = keyword
-
-        if lng is not None:
-            accuracy_label = "精确" if is_accurate else "⚠️ 粗略"
-            df.at[index, '精度'] = accuracy_label
-            df.at[index, '状态'] = "成功" if is_accurate else "精度低"
-
-            if is_accurate:
-                accurate_count += 1
-                print(f"   ✅ {method} | {lng}, {lat}")
-                print(f"   📍 {detail}")
-            else:
-                low_count += 1
-                print(f"   ⚠️  {method} | {lng}, {lat} (仅城市级，不精确!)")
-                print(f"   📍 {detail}")
+def cmd_query(args: argparse.Namespace) -> int:
+    result = _query(args.provider, args.keyword)
+    if not result:
+        if args.json:
+            _print_json({"ok": False, "keyword": args.keyword, "provider": args.provider})
         else:
-            fail_count += 1
-            df.at[index, '精度'] = "失败"
-            df.at[index, '状态'] = "失败"
-            print(f"   ❌ 无结果")
+            print("未找到结果")
+        return 2
 
-        print(f"   ---")
-        time.sleep(0.15)
+    if args.wgs84:
+        wgs_lng, wgs_lat = gcj02_to_wgs84(float(result["lng"]), float(result["lat"]))
+        result = {**result, "wgs_lng": wgs_lng, "wgs_lat": wgs_lat}
+    if args.similarity:
+        result = {**result, "similarity": address_similarity(args.keyword, result)}
 
-    elapsed = time.time() - start_time
+    if args.json:
+        _print_json({"ok": True, "keyword": args.keyword, "provider": args.provider, "result": result})
+    else:
+        print(f"服务: {args.provider}")
+        print(f"关键词: {args.keyword}")
+        print(f"坐标: {result.get('lng')}, {result.get('lat')} ({result.get('coord_type', 'GCJ-02')})")
+        if args.wgs84:
+            print(f"WGS-84: {result.get('wgs_lng')}, {result.get('wgs_lat')}")
+        print(f"匹配方式: {result.get('method', '')}")
+        print(f"地址: {result.get('address', '') or result.get('name', '')}")
+        if args.similarity:
+            print(f"相似度: {result.get('similarity', 0):.0%}")
+    return 0
 
-    # 打印详细统计
-    print(f"\n{'='*70}")
-    print(f"处理完成！耗时: {elapsed:.1f}秒")
-    print(f"{'='*70}")
-    print(f"  总记录数:     {len(df)}")
-    print(f"  ✅ 精确匹配:  {accurate_count} ({accurate_count/len(df)*100:.1f}%)")
-    print(f"  ⚠️  粗略匹配:  {low_count} ({low_count/len(df)*100:.1f}%)")
-    print(f"  ❌ 失败:      {fail_count} ({fail_count/len(df)*100:.1f}%)")
-    print(f"{'='*70}")
 
-    # 打印不精确和失败的记录
-    inaccurate = df[df['精度'] != '精确']
-    if len(inaccurate) > 0:
-        print(f"\n需要关注的记录 ({len(inaccurate)}条):")
-        print(f"{'-'*70}")
-        for idx, r in inaccurate.iterrows():
-            status_icon = "⚠️" if r['精度'] == '⚠️ 粗略' else "❌"
-            print(f"  {status_icon} 行{idx+1}: {r.get('名称','N/A')} | 地址: {r.get('地址','N/A')} | 方式: {r['匹配方式']} | {r['状态']}")
-            if r.get('API返回地址'):
-                print(f"     -> {r['API返回地址']}")
+def cmd_batch(args: argparse.Namespace) -> int:
+    input_file = Path(args.input)
+    _require_file(input_file)
+    output_file = Path(args.output) if args.output else None
+    logger = None if args.quiet else print
 
-    return df
+    if args.provider == "amap":
+        summary = process_amap_excel(
+            input_file,
+            output_path=output_file,
+            log=logger,
+            sleep_seconds=args.delay,
+        )
+    elif args.provider == "baidu":
+        summary = process_baidu_excel(
+            input_file,
+            output_path=output_file,
+            log=logger,
+            sleep_seconds=args.delay,
+        )
+    else:
+        raise ValueError(f"不支持的地图服务: {args.provider}")
 
-# 保存结果到Excel
-def save_to_excel(df, output_file):
+    if args.json:
+        _print_json(_summary_to_dict(summary))
+    else:
+        print(summary.message)
+        print(f"结果已保存到: {summary.output_file}")
+    return 0
+
+
+def cmd_convert(args: argparse.Namespace) -> int:
+    if args.convert_command == "point":
+        if args.direction == "gcj-to-wgs":
+            lng, lat = gcj02_to_wgs84(args.lng, args.lat)
+            coord_type = "WGS-84"
+        else:
+            lng, lat = wgs84_to_gcj02(args.lng, args.lat)
+            coord_type = "GCJ-02"
+
+        if args.json:
+            _print_json({"lng": lng, "lat": lat, "coord_type": coord_type})
+        else:
+            print(f"{lng}, {lat} ({coord_type})")
+        return 0
+
+    input_file = Path(args.input)
+    _require_file(input_file)
+    summary = convert_coordinate_excel(
+        input_file,
+        output_path=Path(args.output) if args.output else None,
+        log=None if args.quiet else print,
+        sleep_seconds=args.delay,
+    )
+    if args.json:
+        _print_json(_summary_to_dict(summary))
+    else:
+        print(summary.message)
+        print(f"结果已保存到: {summary.output_file}")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="python main.py",
+        description="地址经纬度查询、Excel 批处理和坐标转换 CLI 工具。",
+    )
+    parser.set_defaults(func=None)
+    subparsers = parser.add_subparsers(dest="command")
+
+    config = subparsers.add_parser("config", help="查看或保存 API Key 配置")
+    config.add_argument("--amap-key", help="保存高德地图 Web 服务 Key")
+    config.add_argument("--baidu-ak", help="保存百度地图 AK")
+    config.add_argument("--json", action="store_true", help="以 JSON 输出配置状态")
+    config.set_defaults(func=cmd_config)
+
+    query = subparsers.add_parser("query", help="查询单个地址或建筑名称")
+    query.add_argument("keyword", help="地址、建筑名或 POI 关键词")
+    query.add_argument("-p", "--provider", choices=["amap", "baidu"], default="amap", help="地图服务")
+    query.add_argument("--wgs84", action="store_true", help="同时输出 WGS-84 坐标")
+    query.add_argument("--similarity", action="store_true", help="输出输入关键词与结果地址的相似度")
+    query.add_argument("--json", action="store_true", help="以 JSON 输出")
+    query.set_defaults(func=cmd_query)
+
+    batch = subparsers.add_parser("batch", help="批量查询 Excel 文件")
+    batch.add_argument("input", help="输入 Excel 文件，需包含 地址/名称/原名称 等列")
+    batch.add_argument("-p", "--provider", choices=["amap", "baidu"], default="amap", help="地图服务")
+    batch.add_argument("-o", "--output", help="输出 Excel 文件路径")
+    batch.add_argument("--delay", type=float, default=0.15, help="每行请求间隔秒数")
+    batch.add_argument("-q", "--quiet", action="store_true", help="不输出逐行处理日志")
+    batch.add_argument("--json", action="store_true", help="以 JSON 输出处理摘要")
+    batch.set_defaults(func=cmd_batch)
+
+    convert = subparsers.add_parser("convert", help="坐标转换")
+    convert_subparsers = convert.add_subparsers(dest="convert_command", required=True)
+
+    point = convert_subparsers.add_parser("point", help="转换单个坐标点")
+    point.add_argument("lng", type=float, help="经度")
+    point.add_argument("lat", type=float, help="纬度")
+    point.add_argument(
+        "-d",
+        "--direction",
+        choices=["gcj-to-wgs", "wgs-to-gcj"],
+        default="gcj-to-wgs",
+        help="转换方向",
+    )
+    point.add_argument("--json", action="store_true", help="以 JSON 输出")
+    point.set_defaults(func=cmd_convert)
+
+    excel = convert_subparsers.add_parser("excel", help="批量转换 Excel 坐标列")
+    excel.add_argument("input", help='输入 Excel 文件，需包含 "经度" 和 "纬度" 列')
+    excel.add_argument("-o", "--output", help="输出 Excel 文件路径")
+    excel.add_argument("--delay", type=float, default=0.05, help="每行处理间隔秒数")
+    excel.add_argument("-q", "--quiet", action="store_true", help="不输出逐行处理日志")
+    excel.add_argument("--json", action="store_true", help="以 JSON 输出处理摘要")
+    excel.set_defaults(func=cmd_convert)
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.func is None:
+        parser.print_help()
+        return 0
+
     try:
-        df.to_excel(output_file, index=False, engine='openpyxl')
-        print(f"\n结果已保存到: {output_file}")
-        return True
-    except Exception as e:
-        print(f"保存Excel文件失败: {e}")
-        return False
+        return args.func(args)
+    except KeyboardInterrupt:
+        print("已取消", file=sys.stderr)
+        return 130
+    except Exception as err:
+        print(f"错误: {err}", file=sys.stderr)
+        return 1
 
-# 主函数
-def main():
-    file_path = "优秀历史建筑资料.xlsx"
-
-    df = read_excel_file(file_path)
-    if df is None:
-        return
-
-    print(f"\n数据前5行:")
-    print(df[['名称', '地址']].head().to_string())
-
-    df_result = process_addresses(df)
-
-    output_file = "优秀历史建筑资料_经纬度.xlsx"
-    save_to_excel(df_result, output_file)
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

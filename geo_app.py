@@ -1,358 +1,28 @@
-"""
-地址经纬度查询工具
-支持单个地址/建筑名查询，也支持xlsx批量导入导出
-"""
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
-import pandas as pd
-import requests
-import threading
-import time
+"""Tkinter desktop UI for the address geocoding tool."""
+
+from __future__ import annotations
+
 import os
-import sys
-import json
-from urllib.parse import quote
-from convert_to_wgs84 import gcj02_to_wgs84, wgs84_to_gcj02, bd09_to_gcj02, gcj02_to_bd09
+import threading
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
 
-# ========== 配置管理 ==========
+import requests
 
-def _get_app_dir():
-    """获取程序真实所在目录（兼容PyInstaller打包后的exe）"""
-    if getattr(sys, 'frozen', False):
-        # PyInstaller打包后的exe
-        return os.path.dirname(sys.executable)
-    else:
-        # 正常Python脚本运行
-        return os.path.dirname(os.path.abspath(__file__))
+from geo_coordinate_query.batch_convert import convert_coordinate_excel
+from geo_coordinate_query.baidu_excel_processor import process_baidu_excel
+from geo_coordinate_query.config import get_api_key, get_baidu_ak, update_config
+from geo_coordinate_query.coordinates import (
+    bd09_to_gcj02,
+    gcj02_to_bd09,
+    gcj02_to_wgs84,
+    wgs84_to_gcj02,
+)
+from geo_coordinate_query.excel_processor import process_amap_excel
+from geo_coordinate_query.map_services import baidu_smart_search, smart_search
+from geo_coordinate_query.matching import address_similarity
+from geo_coordinate_query.paths import get_app_dir
 
-CONFIG_FILE = os.path.join(_get_app_dir(), 'config.json')
-
-def load_config():
-    """加载配置文件"""
-    if os.path.exists(CONFIG_FILE):
-        try:
-            with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except:
-            pass
-    return {'api_key': '', 'baidu_ak': ''}
-
-def save_config(config):
-    """保存配置文件"""
-    with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
-        json.dump(config, f, ensure_ascii=False, indent=2)
-
-# 全局配置
-_config = load_config()
-
-def get_api_key():
-    return _config.get('api_key', '')
-
-def get_baidu_ak():
-    return _config.get('baidu_ak', '')
-
-# ========== API查询函数 ==========
-
-def geocode_search(keyword, api_key=None):
-    """地理编码搜索"""
-    key = api_key or get_api_key()
-    if not key:
-        return None
-    encoded = quote(keyword.strip())
-    url = f"https://restapi.amap.com/v3/geocode/geo?address={encoded}&key={key}"
-    try:
-        resp = requests.get(url, timeout=10)
-        data = resp.json()
-        if data.get('status') == '1' and data.get('count') != '0':
-            geo = data['geocodes'][0]
-            lng, lat = geo['location'].split(',')
-            district = geo.get('district', '')
-            city = geo.get('city', '')
-            province = geo.get('province', '')
-            formatted = geo.get('formatted_address', '')
-            level = geo.get('level', '')
-            is_accurate = bool(district)
-            return {
-                'lng': float(lng), 'lat': float(lat),
-                'province': province, 'city': city, 'district': district,
-                'address': formatted, 'level': level,
-                'accurate': is_accurate, 'method': 'geocode',
-                'coord_type': 'GCJ-02'
-            }
-    except:
-        pass
-    return None
-
-def poi_search(keyword, city='', api_key=None):
-    """POI搜索"""
-    key = api_key or get_api_key()
-    if not key:
-        return None
-    encoded = quote(keyword.strip())
-    url = f"https://restapi.amap.com/v3/place/text?keywords={encoded}&city={quote(city)}&key={key}&offset=3"
-    try:
-        resp = requests.get(url, timeout=10)
-        data = resp.json()
-        if data.get('status') == '1' and int(data.get('count', 0)) > 0:
-            poi = data['pois'][0]
-            lng, lat = poi['location'].split(',')
-            return {
-                'lng': float(lng), 'lat': float(lat),
-                'province': poi.get('pname', ''),
-                'city': poi.get('cityname', ''),
-                'district': poi.get('adname', ''),
-                'address': poi.get('address', ''),
-                'name': poi.get('name', ''),
-                'tel': poi.get('tel', ''),
-                'type': poi.get('type', ''),
-                'accurate': True, 'method': 'POI',
-                'coord_type': 'GCJ-02'
-            }
-    except:
-        pass
-    return None
-
-def smart_search(keyword):
-    """多策略智能搜索，返回最佳结果"""
-    if not keyword or not keyword.strip():
-        return None
-    keyword = keyword.strip()
-    candidates = []
-
-    result = geocode_search(keyword)
-    if result:
-        candidates.append(result)
-        if result['accurate']:
-            return result
-
-    result = poi_search(keyword)
-    if result:
-        candidates.append(result)
-        if result['accurate']:
-            return result
-
-    return candidates[0] if candidates else None
-
-# ========== 百度地图API查询函数 ==========
-
-def baidu_geocode_search(keyword, ak=None):
-    """百度地图地理编码搜索"""
-    key = ak or get_baidu_ak()
-    if not key:
-        return None
-    encoded = quote(keyword.strip())
-    url = f"https://api.map.baidu.com/geocoding/v3/?address={encoded}&ak={key}&output=json"
-    try:
-        resp = requests.get(url, timeout=10)
-        data = resp.json()
-        if data.get('status') == 0 and data.get('result'):
-            result = data['result']
-            location = result.get('location', {})
-            lng = location.get('lng', 0)
-            lat = location.get('lat', 0)
-            # 百度返回BD-09坐标，转换为GCJ-02
-            gcj_lng, gcj_lat = bd09_to_gcj02(lng, lat)
-            confidence = result.get('confidence', 0)
-            level = result.get('level', '')
-            is_accurate = confidence >= 50 and level not in ['城市', '区县', '乡镇']
-            return {
-                'lng': gcj_lng, 'lat': gcj_lat,
-                'bd_lng': lng, 'bd_lat': lat,
-                'province': '', 'city': '', 'district': '',
-                'address': keyword.strip(),
-                'confidence': confidence, 'level': level,
-                'accurate': is_accurate, 'method': '百度geocode',
-                'coord_type': 'GCJ-02(由BD-09转换)'
-            }
-    except Exception:
-        pass
-    return None
-
-def baidu_poi_search(keyword, city='', ak=None):
-    """百度地图POI搜索"""
-    key = ak or get_baidu_ak()
-    if not key:
-        return None
-    encoded = quote(keyword.strip())
-    encoded_city = quote(city) if city else ''
-    url = f"https://api.map.baidu.com/place/v2/search?query={encoded}&region={encoded_city}&ak={key}&output=json&page_size=3"
-    try:
-        resp = requests.get(url, timeout=10)
-        data = resp.json()
-        if data.get('status') == 0 and data.get('results') and len(data['results']) > 0:
-            poi = data['results'][0]
-            location = poi.get('location', {})
-            lng = location.get('lng', 0)
-            lat = location.get('lat', 0)
-            # 百度返回BD-09坐标，转换为GCJ-02
-            gcj_lng, gcj_lat = bd09_to_gcj02(lng, lat)
-            province = poi.get('province', '')
-            city_name = poi.get('city', '')
-            area = poi.get('area', '')
-            address = poi.get('address', '')
-            name = poi.get('name', '')
-            overall_rating = poi.get('overall_rating', '')
-            return {
-                'lng': gcj_lng, 'lat': gcj_lat,
-                'bd_lng': lng, 'bd_lat': lat,
-                'province': province, 'city': city_name, 'district': area,
-                'address': address, 'name': name,
-                'tel': poi.get('telephone', ''),
-                'type': poi.get('tag', ''),
-                'rating': overall_rating,
-                'accurate': True, 'method': '百度POI',
-                'coord_type': 'GCJ-02(由BD-09转换)'
-            }
-    except Exception:
-        pass
-    return None
-
-def baidu_smart_search(keyword):
-    """百度地图多策略智能搜索"""
-    if not keyword or not keyword.strip():
-        return None
-    keyword = keyword.strip()
-    candidates = []
-
-    result = baidu_geocode_search(keyword)
-    if result:
-        candidates.append(result)
-        if result['accurate']:
-            return result
-
-    result = baidu_poi_search(keyword)
-    if result:
-        candidates.append(result)
-        if result['accurate']:
-            return result
-
-    return candidates[0] if candidates else None
-
-# ========== 地址相似度验证 ==========
-
-def address_similarity(input_addr, api_result):
-    """计算用户输入地址与API返回地址的相似度（0~1）
-
-    算法：
-    1. 最长公共子序列(LCS)比率 —— 保留字符顺序，适合地址/地名混合输入
-    2. 以较短串为基准归一化 —— 短地名匹配长地址时不会系统性偏低
-    3. 省市区结构化字段加权 —— 提升行政区匹配的可信度
-    """
-    if not input_addr or not api_result:
-        return 0.0
-
-    def _clean(s):
-        return str(s).replace(' ', '').replace('(', '').replace(')', '') \
-                     .replace('（', '').replace('）', '') \
-                     .replace('[', '').replace(']', '')
-
-    # 取 API 返回的地址或名称
-    api_addr = _clean(api_result.get('address', '') or api_result.get('name', ''))
-    input_clean = _clean(input_addr)
-    if not api_addr or not input_clean:
-        return 0.0
-
-    # --- 最长公共子序列(LCS)长度 ---
-    m, n = len(input_clean), len(api_addr)
-    # 空间优化：只保留两行
-    prev = [0] * (n + 1)
-    curr = [0] * (n + 1)
-    for i in range(1, m + 1):
-        for j in range(1, n + 1):
-            if input_clean[i - 1] == api_addr[j - 1]:
-                curr[j] = prev[j - 1] + 1
-            else:
-                curr[j] = max(prev[j], curr[j - 1])
-        prev, curr = curr, [0] * (n + 1)
-    lcs_len = prev[n]
-
-    # 以较短串为基准归一化（短地名 vs 长地址不会偏低）
-    min_len = min(m, n)
-    max_len = max(m, n)
-    lcs_ratio = lcs_len / min_len if min_len > 0 else 0.0
-
-    # 长度惩罚：两者长度差距越大，对比率打一定折扣
-    length_factor = min_len / max_len if max_len > 0 else 1.0
-    sequence_score = lcs_ratio * (0.7 + 0.3 * length_factor)
-
-    # 包含关系加成：较短串完全包含在较长串中时，大幅提升分数
-    shorter = input_clean if m <= n else api_addr
-    longer = api_addr if m <= n else input_clean
-    if shorter in longer:
-        # 完全包含时，以占比为基准（如“黎黄陂路”在“武汉市江岸区黎黄陂路”中占 4/11）
-        contain_ratio = len(shorter) / len(longer) if len(longer) > 0 else 1.0
-        sequence_score = max(sequence_score, 0.85 + 0.15 * contain_ratio)
-
-    # --- 结构化字段加权 ---
-    bonus = 0.0
-    province = api_result.get('province', '')
-    city = api_result.get('city', '')
-    district = api_result.get('district', '')
-    if province and province in input_addr:
-        bonus += 0.08
-    if city and str(city) != '[]' and str(city) in input_addr:
-        bonus += 0.08
-    if district and district in input_addr:
-        bonus += 0.14
-
-    score = min(1.0, sequence_score * (0.70 + 0.30 * sequence_score) + bonus)
-    return round(score, 2)
-
-# ========== Excel处理函数 ==========
-
-def build_search_address(row):
-    address = str(row.get('地址', '')).strip() if pd.notna(row.get('地址')) else ''
-    name = str(row.get('名称', '')).strip() if pd.notna(row.get('名称')) else ''
-    old_name = str(row.get('原名称', '')).strip() if pd.notna(row.get('原名称')) else ''
-    if address and len(address) > 3:
-        return address
-    if name and name != 'nan' and len(name) > 2:
-        return f"武汉市{name}"
-    if old_name and old_name != 'nan' and len(old_name) > 2:
-        return f"武汉市{old_name}"
-    return address if address else name
-
-def smart_search_excel(row):
-    address = str(row.get('地址', '')).strip() if pd.notna(row.get('地址')) else ''
-    name = str(row.get('名称', '')).strip() if pd.notna(row.get('名称')) else ''
-    old_name = str(row.get('原名称', '')).strip() if pd.notna(row.get('原名称')) else ''
-    candidates = []
-
-    if address and len(address) > 3:
-        result = geocode_search(address)
-        if result:
-            candidates.append((result, address))
-            if result['accurate']:
-                return result, address
-
-    if name and name != 'nan' and len(name) > 2 and name not in ['居民住宅', '幼儿园']:
-        result = poi_search(name)
-        if result:
-            candidates.append((result, name))
-            if result['accurate']:
-                return result, name
-
-    if old_name and old_name != 'nan' and len(old_name) > 2:
-        result = poi_search(old_name)
-        if result:
-            candidates.append((result, old_name))
-            if result['accurate']:
-                return result, old_name
-
-    if name and address and name != 'nan':
-        combined = f"{name}({address})"
-        result = poi_search(combined)
-        if result:
-            candidates.append((result, combined))
-
-    for c, kw in candidates:
-        if c.get('accurate'):
-            return c, kw
-    if candidates:
-        return candidates[0]
-    return None, ""
-
-# ========== GUI应用 ==========
 
 class GeoApp:
     def __init__(self, root):
@@ -646,7 +316,7 @@ class GeoApp:
         path = filedialog.askopenfilename(
             title="选择Excel文件",
             filetypes=[("Excel文件", "*.xlsx *.xls")],
-            initialdir=_get_app_dir()
+            initialdir=str(get_app_dir())
         )
         if path:
             self.convert_file_var.set(path)
@@ -659,7 +329,7 @@ class GeoApp:
         self.root.update_idletasks()
 
     def _do_batch_convert(self):
-        """批量坐标转换"""
+        """Batch convert selected Excel coordinates."""
         file_path = self.convert_file_var.get().strip()
         if not file_path or not os.path.exists(file_path):
             messagebox.showwarning("提示", "请先选择有效的Excel文件")
@@ -670,62 +340,36 @@ class GeoApp:
 
         def task():
             try:
-                df = pd.read_excel(file_path)
-                # 检查必须包含经度和纬度列
-                if '经度' not in df.columns or '纬度' not in df.columns:
-                    self.root.after(0, lambda: messagebox.showerror("格式错误",
-                        "Excel文件必须包含 \"\u7ecf\u5ea6\" 和 \"\u7eac\u5ea6\" 列！\n"
-                        "请检查列名是否正确。"))
-                    self.root.after(0, lambda: self.convert_batch_btn.configure(state='normal'))
-                    return
-
-                total = len(df)
-                self.root.after(0, lambda: self._convert_log(
-                    f"读取文件: {os.path.basename(file_path)}，共{total}行"))
-
-                df['WGS84经度'] = None
-                df['WGS84纬度'] = None
-                converted = 0
-                failed = 0
-
-                for idx, row in df.iterrows():
-                    lng = row.get('经度')
-                    lat = row.get('纬度')
-                    if pd.notna(lng) and pd.notna(lat):
-                        try:
-                            wgs_lng, wgs_lat = gcj02_to_wgs84(float(lng), float(lat))
-                            df.at[idx, 'WGS84经度'] = wgs_lng
-                            df.at[idx, 'WGS84纬度'] = wgs_lat
-                            converted += 1
-                            self.root.after(0, lambda i=idx, t=total, wl=wgs_lng, wa=wgs_lat:
-                                self._convert_log(f"[{i+1}/{t}] OK -> {wl},{wa}"))
-                        except Exception:
-                            failed += 1
-                            self.root.after(0, lambda i=idx:
-                                self._convert_log(f"[{i+1}] 失败: 经纬度格式错误"))
-                    else:
-                        failed += 1
-
-                    pct = (idx + 1) / total * 100
-                    self.root.after(0, lambda p=pct: self.convert_progress.configure(value=p))
-                    self.root.after(0, lambda i=idx, t=total:
-                        self.convert_batch_status.configure(text=f"转换中 {i+1}/{t}"))
-                    time.sleep(0.05)
-
-                dir_path = os.path.dirname(file_path)
-                base_name = os.path.splitext(os.path.basename(file_path))[0]
-                output_file = os.path.join(dir_path, f"{base_name}_WGS84.xlsx")
-                df.to_excel(output_file, index=False, engine='openpyxl')
-
-                summary = f"完成! 转换成功:{converted} 失败:{failed} 共:{total}"
-                self.root.after(0, lambda: self._convert_log(summary))
-                self.root.after(0, lambda: self.convert_batch_status.configure(text=summary))
-                self.root.after(0, lambda: messagebox.showinfo("转换完成",
-                    f"结果已保存到:\n{output_file}\n\n转换成功: {converted}\n失败: {failed}"))
-
-            except Exception as e:
-                self.root.after(0, lambda: messagebox.showerror("错误", f"处理失败:\n{str(e)}"))
-                self.root.after(0, lambda: self._convert_log(f"错误: {str(e)}"))
+                summary = convert_coordinate_excel(
+                    file_path,
+                    log=lambda msg: self.root.after(0, lambda m=msg: self._convert_log(m)),
+                    status=lambda pct, text: self.root.after(
+                        0,
+                        lambda p=pct, t=text: (
+                            self.convert_progress.configure(value=p),
+                            self.convert_batch_status.configure(text=t),
+                        ),
+                    ),
+                )
+                self.root.after(0, lambda: self._convert_log(summary.message))
+                self.root.after(0, lambda: self.convert_batch_status.configure(text=summary.message))
+                self.root.after(
+                    0,
+                    lambda: messagebox.showinfo(
+                        "转换完成",
+                        "结果已保存到:\n"
+                        f"{summary.output_file}\n\n"
+                        f"转换成功: {summary.converted}\n"
+                        f"失败: {summary.failed}",
+                    ),
+                )
+            except ValueError as err:
+                error_message = str(err)
+                self.root.after(0, lambda msg=error_message: messagebox.showerror("格式错误", msg))
+            except Exception as err:
+                error_message = str(err)
+                self.root.after(0, lambda msg=error_message: messagebox.showerror("错误", f"处理失败:\n{msg}"))
+                self.root.after(0, lambda msg=error_message: self._convert_log(f"错误: {msg}"))
             finally:
                 self.root.after(0, lambda: self.convert_batch_btn.configure(state='normal'))
 
@@ -893,7 +537,7 @@ class GeoApp:
         path = filedialog.askopenfilename(
             title="选择Excel文件",
             filetypes=[("Excel文件", "*.xlsx *.xls")],
-            initialdir=_get_app_dir()
+            initialdir=str(get_app_dir())
         )
         if path:
             self.baidu_file_var.set(path)
@@ -941,81 +585,30 @@ class GeoApp:
 
         def task():
             try:
-                df = pd.read_excel(file_path)
-                total = len(df)
-                self.root.after(0, lambda: self._baidu_log(f"读取文件: {os.path.basename(file_path)}，共{total}行"))
-
-                df['经度'] = None
-                df['纬度'] = None
-                df['WGS84经度'] = None
-                df['WGS84纬度'] = None
-                df['坐标系'] = 'GCJ-02(由BD-09转换)'
-                df['省份'] = None
-                df['城市'] = None
-                df['区县'] = None
-                df['API返回地址'] = None
-                df['匹配方式'] = None
-                df['精度'] = None
-                df['地址相似度'] = None
-
-                accurate = 0
-                low = 0
-                fail = 0
-
-                for idx, row in df.iterrows():
-                    search_kw = build_search_address(row)
-                    result = baidu_smart_search(search_kw)
-
-                    if result:
-                        df.at[idx, '经度'] = result['lng']
-                        df.at[idx, '纬度'] = result['lat']
-                        try:
-                            wgs_lng, wgs_lat = gcj02_to_wgs84(float(result['lng']), float(result['lat']))
-                            df.at[idx, 'WGS84经度'] = wgs_lng
-                            df.at[idx, 'WGS84纬度'] = wgs_lat
-                        except Exception:
-                            self.root.after(0, lambda i=idx: self._baidu_log(f"  [警告] 第{i+1}行 WGS-84转换失败"))
-                        sim = address_similarity(search_kw, result)
-                        df.at[idx, '地址相似度'] = sim
-                        df.at[idx, '省份'] = result.get('province', '')
-                        df.at[idx, '城市'] = result.get('city', '')
-                        df.at[idx, '区县'] = result.get('district', '')
-                        df.at[idx, 'API返回地址'] = result.get('address', '') or result.get('name', '')
-                        df.at[idx, '匹配方式'] = result.get('method', '')
-                        df.at[idx, '坐标系'] = result.get('coord_type', 'GCJ-02(由BD-09转换)')
-
-                        if result.get('accurate'):
-                            df.at[idx, '精度'] = '精确'
-                            accurate += 1
-                        else:
-                            df.at[idx, '精度'] = '粗略'
-                            low += 1
-
-                        status = "OK" if result.get('accurate') else "LOW"
-                        sim_warn = " [相似度低]" if sim < 0.4 else ""
-                        self.root.after(0, lambda i=idx, t=total, s=status, r=result, sm=sim, sw=sim_warn:
-                            self._baidu_log(f"[{i+1}/{t}] {s} {r['lng']},{r['lat']} ({r.get('address','')}){sw} (相似度:{sm:.0%})"))
-                    else:
-                        fail += 1
-                        df.at[idx, '精度'] = '失败'
-                        self.root.after(0, lambda i=idx, t=total:
-                            self._baidu_log(f"[{i+1}/{t}] FAIL"))
-
-                    pct = (idx + 1) / total * 100
-                    self.root.after(0, lambda p=pct: self.baidu_progress.configure(value=p))
-                    self.root.after(0, lambda i=idx, t=total: self.baidu_batch_status.configure(text=f"处理中 {i+1}/{t}"))
-                    time.sleep(0.15)
-
-                dir_path = os.path.dirname(file_path)
-                base_name = os.path.splitext(os.path.basename(file_path))[0]
-                output_file = os.path.join(dir_path, f"{base_name}_百度经纬度.xlsx")
-                df.to_excel(output_file, index=False, engine='openpyxl')
-
-                summary = f"完成! 精确:{accurate} 粗略:{low} 失败:{fail} 共:{total}"
-                self.root.after(0, lambda: self._baidu_log(summary))
-                self.root.after(0, lambda: self.baidu_batch_status.configure(text=summary))
-                self.root.after(0, lambda: messagebox.showinfo("处理完成",
-                    f"结果已保存到:\n{output_file}\n\n精确匹配: {accurate}\n粗略匹配: {low}\n失败: {fail}"))
+                summary = process_baidu_excel(
+                    file_path,
+                    log=lambda msg: self.root.after(0, lambda m=msg: self._baidu_log(m)),
+                    status=lambda pct, text: self.root.after(
+                        0,
+                        lambda p=pct, t=text: (
+                            self.baidu_progress.configure(value=p),
+                            self.baidu_batch_status.configure(text=t),
+                        ),
+                    ),
+                )
+                self.root.after(0, lambda: self._baidu_log(summary.message))
+                self.root.after(0, lambda: self.baidu_batch_status.configure(text=summary.message))
+                self.root.after(
+                    0,
+                    lambda: messagebox.showinfo(
+                        "处理完成",
+                        "结果已保存到:\n"
+                        f"{summary.output_file}\n\n"
+                        f"精确匹配: {summary.accurate}\n"
+                        f"粗略匹配: {summary.low}\n"
+                        f"失败: {summary.fail}",
+                    ),
+                )
 
             except Exception as e:
                 self.root.after(0, lambda: messagebox.showerror("错误", f"处理失败:\n{str(e)}"))
@@ -1185,13 +778,11 @@ class GeoApp:
             self.key_status_label.pack(pady=(0, 5))
 
     def _save_key(self):
-        global _config
         new_key = self.key_entry.get().strip()
         if not new_key:
             messagebox.showwarning("提示", "请输入 API Key")
             return
-        _config['api_key'] = new_key
-        save_config(_config)
+        update_config(api_key=new_key)
         self.key_save_status.configure(text="已保存!")
         self._update_key_status()
         # 2秒后清除保存提示
@@ -1220,8 +811,9 @@ class GeoApp:
                     self.root.after(0, lambda: self.test_result_label.configure(
                         text=f"Key 无效: {info}", foreground='#e74c3c'))
             except Exception as e:
-                self.root.after(0, lambda: self.test_result_label.configure(
-                    text=f"网络错误: {str(e)[:30]}", foreground='#e74c3c'))
+                error_message = str(e)[:30]
+                self.root.after(0, lambda msg=error_message: self.test_result_label.configure(
+                    text=f"网络错误: {msg}", foreground='#e74c3c'))
 
         threading.Thread(target=task, daemon=True).start()
 
@@ -1230,13 +822,11 @@ class GeoApp:
         webbrowser.open(url)
 
     def _save_baidu_ak(self):
-        global _config
         new_ak = self.baidu_ak_entry.get().strip()
         if not new_ak:
             messagebox.showwarning("提示", "请输入百度地图 AK")
             return
-        _config['baidu_ak'] = new_ak
-        save_config(_config)
+        update_config(baidu_ak=new_ak)
         self.baidu_ak_save_status.configure(text="已保存!")
         self._update_baidu_ak_status()
         self.root.after(2000, lambda: self.baidu_ak_save_status.configure(text=""))
@@ -1262,8 +852,9 @@ class GeoApp:
                     self.root.after(0, lambda: self.baidu_test_result_label.configure(
                         text=f"AK 无效: {msg}", foreground='#e74c3c'))
             except Exception as e:
-                self.root.after(0, lambda: self.baidu_test_result_label.configure(
-                    text=f"网络错误: {str(e)[:30]}", foreground='#e74c3c'))
+                error_message = str(e)[:30]
+                self.root.after(0, lambda msg=error_message: self.baidu_test_result_label.configure(
+                    text=f"网络错误: {msg}", foreground='#e74c3c'))
 
         threading.Thread(target=task, daemon=True).start()
 
@@ -1279,7 +870,7 @@ class GeoApp:
         path = filedialog.askopenfilename(
             title="选择Excel文件",
             filetypes=[("Excel文件", "*.xlsx *.xls")],
-            initialdir=_get_app_dir()
+            initialdir=str(get_app_dir())
         )
         if path:
             self.file_var.set(path)
@@ -1410,93 +1001,46 @@ class GeoApp:
 
         def task():
             try:
-                df = pd.read_excel(file_path)
-                total = len(df)
-                self.root.after(0, lambda: self._log(f"读取文件: {os.path.basename(file_path)}，共{total}行"))
-
-                df['经度'] = None
-                df['纬度'] = None
-                df['WGS84经度'] = None
-                df['WGS84纬度'] = None
-                df['坐标系'] = 'GCJ-02'
-                df['省份'] = None
-                df['城市'] = None
-                df['区县'] = None
-                df['API返回地址'] = None
-                df['匹配方式'] = None
-                df['精度'] = None
-                df['地址相似度'] = None
-
-                accurate = 0
-                low = 0
-                fail = 0
-
-                for idx, row in df.iterrows():
-                    search_kw = build_search_address(row)
-                    result, kw_used = smart_search_excel(row)
-
-                    if result:
-                        df.at[idx, '经度'] = result['lng']
-                        df.at[idx, '纬度'] = result['lat']
-                        # 计算 WGS-84 坐标
-                        try:
-                            wgs_lng, wgs_lat = gcj02_to_wgs84(float(result['lng']), float(result['lat']))
-                            df.at[idx, 'WGS84经度'] = wgs_lng
-                            df.at[idx, 'WGS84纬度'] = wgs_lat
-                        except Exception:
-                            self.root.after(0, lambda i=idx: self._log(f"  [警告] 第{i+1}行 WGS-84转换失败"))
-                        # 计算地址相似度
-                        sim = address_similarity(search_kw, result)
-                        df.at[idx, '地址相似度'] = sim
-                        df.at[idx, '省份'] = result.get('province', '')
-                        df.at[idx, '城市'] = result.get('city', '')
-                        df.at[idx, '区县'] = result.get('district', '')
-                        df.at[idx, 'API返回地址'] = result.get('address', '') or result.get('name', '')
-                        df.at[idx, '匹配方式'] = result.get('method', '')
-                        df.at[idx, '坐标系'] = result.get('coord_type', 'GCJ-02')
-
-                        if result.get('accurate'):
-                            df.at[idx, '精度'] = '精确'
-                            accurate += 1
-                        else:
-                            df.at[idx, '精度'] = '粗略'
-                            low += 1
-
-                        status = "OK" if result.get('accurate') else "LOW"
-                        sim_warn = " [相似度低]" if sim < 0.4 else ""
-                        self.root.after(0, lambda i=idx, t=total, s=status, r=result, sm=sim, sw=sim_warn:
-                            self._log(f"[{i+1}/{t}] {s} {r['lng']},{r['lat']} ({r.get('address','')}){sw} (相似度:{sm:.0%})"))
-                    else:
-                        fail += 1
-                        df.at[idx, '精度'] = '失败'
-                        self.root.after(0, lambda i=idx, t=total:
-                            self._log(f"[{i+1}/{t}] FAIL"))
-
-                    pct = (idx + 1) / total * 100
-                    self.root.after(0, lambda p=pct: self.progress.configure(value=p))
-                    self.root.after(0, lambda i=idx, t=total: self.batch_status.configure(text=f"处理中 {i+1}/{t}"))
-                    time.sleep(0.15)
-
-                dir_path = os.path.dirname(file_path)
-                base_name = os.path.splitext(os.path.basename(file_path))[0]
-                output_file = os.path.join(dir_path, f"{base_name}_经纬度.xlsx")
-                df.to_excel(output_file, index=False, engine='openpyxl')
-
-                summary = f"完成! 精确:{accurate} 粗略:{low} 失败:{fail} 共:{total}"
-                self.root.after(0, lambda: self._log(summary))
-                self.root.after(0, lambda: self.batch_status.configure(text=summary))
-                self.root.after(0, lambda: messagebox.showinfo("处理完成",
-                    f"结果已保存到:\n{output_file}\n\n精确匹配: {accurate}\n粗略匹配: {low}\n失败: {fail}"))
-
-            except Exception as e:
-                self.root.after(0, lambda: messagebox.showerror("错误", f"处理失败:\n{str(e)}"))
-                self.root.after(0, lambda: self._log(f"错误: {str(e)}"))
+                summary = process_amap_excel(
+                    file_path,
+                    log=lambda msg: self.root.after(0, lambda m=msg: self._log(m)),
+                    status=lambda pct, text: self.root.after(
+                        0,
+                        lambda p=pct, t=text: (
+                            self.progress.configure(value=p),
+                            self.batch_status.configure(text=t),
+                        ),
+                    ),
+                )
+                self.root.after(0, lambda: self._log(summary.message))
+                self.root.after(0, lambda: self.batch_status.configure(text=summary.message))
+                self.root.after(
+                    0,
+                    lambda: messagebox.showinfo(
+                        "处理完成",
+                        "结果已保存到:\n"
+                        f"{summary.output_file}\n\n"
+                        f"精确匹配: {summary.accurate}\n"
+                        f"粗略匹配: {summary.low}\n"
+                        f"失败: {summary.fail}",
+                    ),
+                )
+            except Exception as err:
+                error_message = str(err)
+                self.root.after(0, lambda msg=error_message: messagebox.showerror("错误", f"处理失败:\n{msg}"))
+                self.root.after(0, lambda msg=error_message: self._log(f"错误: {msg}"))
             finally:
                 self.root.after(0, lambda: self.batch_btn.configure(state='normal'))
 
         threading.Thread(target=task, daemon=True).start()
 
-if __name__ == "__main__":
+
+
+def main() -> None:
     root = tk.Tk()
-    app = GeoApp(root)
+    GeoApp(root)
     root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
