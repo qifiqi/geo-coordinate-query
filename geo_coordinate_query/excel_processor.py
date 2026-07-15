@@ -1,4 +1,4 @@
-"""Excel row preparation and batch geocoding helpers."""
+"""Excel row preparation and provider-independent batch geocoding."""
 
 from __future__ import annotations
 
@@ -11,8 +11,8 @@ from typing import Any
 import pandas as pd
 
 from .coordinates import gcj02_to_wgs84
-from .map_services import geocode_search, poi_search
 from .matching import address_similarity
+from .query_service import PlaceQueryService, ProviderName
 
 ProgressCallback = Callable[[str], None]
 StatusCallback = Callable[[float, str], None]
@@ -20,6 +20,8 @@ StatusCallback = Callable[[float, str], None]
 
 @dataclass(frozen=True)
 class BatchSummary:
+    """Summary of one workbook geocoding run."""
+
     output_file: Path
     accurate: int
     low: int
@@ -28,87 +30,54 @@ class BatchSummary:
 
     @property
     def message(self) -> str:
-        return (
-            f"完成! 精确:{self.accurate} 粗略:{self.low} "
-            f"失败:{self.fail} 共:{self.total}"
-        )
+        return f"完成! 精确:{self.accurate} 粗略:{self.low} 失败:{self.fail} 共:{self.total}"
 
 
 def _cell_text(row: pd.Series, column: str) -> str:
     value = row.get(column)
-    if pd.isna(value):
-        return ""
-    return str(value).strip()
+    return "" if pd.isna(value) else str(value).strip()
 
 
-def build_search_address(row: pd.Series) -> str:
-    """Build the best search keyword from one source workbook row."""
-    address = _cell_text(row, "地址")
-    name = _cell_text(row, "名称")
-    old_name = _cell_text(row, "原名称")
-
-    if address and len(address) > 3:
-        return address
-    if name and name != "nan" and len(name) > 2:
-        return f"武汉市{name}"
-    if old_name and old_name != "nan" and len(old_name) > 2:
-        return f"武汉市{old_name}"
-    return address or name
+def build_search_address(row: pd.Series, city: str = "") -> str:
+    """Build the primary query from the conventional source columns."""
+    return next(iter(_row_queries(row, city)), "")
 
 
-def smart_search_excel(row: pd.Series) -> tuple[dict[str, Any] | None, str]:
-    """Search one Excel row with address, name, and old-name fallbacks."""
-    address = _cell_text(row, "地址")
-    name = _cell_text(row, "名称")
-    old_name = _cell_text(row, "原名称")
+def smart_search_excel(
+    row: pd.Series,
+    provider: ProviderName = "amap",
+    service: PlaceQueryService | None = None,
+    city: str = "",
+) -> tuple[dict[str, Any] | None, str]:
+    """Find the best map candidate for one source workbook row."""
+    query_service = service or PlaceQueryService()
     candidates: list[tuple[dict[str, Any], str]] = []
+    query_city = _cell_text(row, "城市") or city
+    for query in _row_queries(row, query_city):
+        for candidate in query_service.search(query, query_city, provider):
+            candidates.append((candidate.as_dict(), query))
+    if not candidates:
+        return None, ""
 
-    if address and len(address) > 3:
-        result = geocode_search(address)
-        if result:
-            candidates.append((result, address))
-            if result["accurate"]:
-                return result, address
-
-    if name and name != "nan" and len(name) > 2 and name not in ["居民住宅", "幼儿园"]:
-        result = poi_search(name)
-        if result:
-            candidates.append((result, name))
-            if result["accurate"]:
-                return result, name
-
-    if old_name and old_name != "nan" and len(old_name) > 2:
-        result = poi_search(old_name)
-        if result:
-            candidates.append((result, old_name))
-            if result["accurate"]:
-                return result, old_name
-
-    if name and address and name != "nan":
-        combined = f"{name}({address})"
-        result = poi_search(combined)
-        if result:
-            candidates.append((result, combined))
-
-    for candidate, keyword in candidates:
-        if candidate.get("accurate"):
-            return candidate, keyword
-    if candidates:
-        return candidates[0]
-    return None, ""
+    result, query = max(
+        candidates,
+        key=lambda item: (float(item[0].get("similarity", 0)), bool(item[0].get("accurate"))),
+    )
+    return result, query
 
 
 def prepare_result_columns(df: pd.DataFrame) -> None:
-    """Create the columns written by the batch geocoding process."""
+    """Create the output fields added by the batch geocoding process."""
     columns: dict[str, Any] = {
         "经度": None,
         "纬度": None,
         "WGS84经度": None,
         "WGS84纬度": None,
         "坐标系": "GCJ-02",
-        "省份": None,
-        "城市": None,
-        "区县": None,
+        "地图服务": None,
+        "API省份": None,
+        "API城市": None,
+        "API区县": None,
         "API返回地址": None,
         "匹配方式": None,
         "精度": None,
@@ -125,67 +94,62 @@ def write_geocode_result(
     result: dict[str, Any],
     log: ProgressCallback | None = None,
 ) -> float:
-    """Write one provider result into a workbook row and return similarity."""
+    """Write one candidate to a workbook row and return its similarity."""
     df.at[idx, "经度"] = result["lng"]
     df.at[idx, "纬度"] = result["lat"]
     try:
-        wgs_lng, wgs_lat = gcj02_to_wgs84(
-            float(result["lng"]),
-            float(result["lat"]),
-        )
+        wgs_lng, wgs_lat = gcj02_to_wgs84(float(result["lng"]), float(result["lat"]))
         df.at[idx, "WGS84经度"] = wgs_lng
         df.at[idx, "WGS84纬度"] = wgs_lat
     except (TypeError, ValueError) as err:
         if log:
             log(f"  [警告] 第{idx + 1}行 WGS-84转换失败: {err}")
 
-    sim = address_similarity(search_kw, result)
-    df.at[idx, "地址相似度"] = sim
-    df.at[idx, "省份"] = result.get("province", "")
-    df.at[idx, "城市"] = result.get("city", "")
-    df.at[idx, "区县"] = result.get("district", "")
+    similarity = address_similarity(search_kw, result)
+    df.at[idx, "地址相似度"] = similarity
+    df.at[idx, "地图服务"] = result.get("provider", "")
+    df.at[idx, "API省份"] = result.get("province", "")
+    df.at[idx, "API城市"] = result.get("city", "")
+    df.at[idx, "API区县"] = result.get("district", "")
     df.at[idx, "API返回地址"] = result.get("address", "") or result.get("name", "")
     df.at[idx, "匹配方式"] = result.get("method", "")
     df.at[idx, "坐标系"] = result.get("coord_type", "GCJ-02")
-    return sim
+    return similarity
 
 
-def process_amap_excel(
+def process_excel(
     file_path: str | Path,
+    provider: ProviderName = "amap",
     output_path: str | Path | None = None,
     log: ProgressCallback | None = None,
     status: StatusCallback | None = None,
     sleep_seconds: float = 0.15,
+    city: str = "",
 ) -> BatchSummary:
-    """Geocode an Excel file with AMap and save a sibling result workbook."""
+    """Geocode an Excel file through the selected map provider strategy."""
     input_file = Path(file_path)
     df = pd.read_excel(input_file)
     total = len(df)
     if log:
-        log(f"读取文件: {input_file.name}，共{total}行")
+        log(f"读取文件: {input_file.name}，共{total}行，服务:{provider}")
 
     prepare_result_columns(df)
     accurate = low = fail = 0
-
+    service = PlaceQueryService()
     for idx, row in df.iterrows():
-        search_kw = build_search_address(row)
-        result, _ = smart_search_excel(row)
-
+        result, search_kw = smart_search_excel(row, provider, service, city)
         if result:
-            sim = write_geocode_result(df, idx, search_kw, result, log)
-            if result.get("accurate"):
-                df.at[idx, "精度"] = "精确"
-                accurate += 1
-            else:
-                df.at[idx, "精度"] = "粗略"
-                low += 1
-
-            status_text = "OK" if result.get("accurate") else "LOW"
-            sim_warn = " [相似度低]" if sim < 0.4 else ""
+            similarity = write_geocode_result(df, idx, search_kw, result, log)
+            is_accurate = bool(result.get("accurate")) and similarity >= 0.5
+            df.at[idx, "精度"] = "精确" if is_accurate else "粗略"
+            accurate += int(is_accurate)
+            low += int(not is_accurate)
             if log:
+                quality = "OK" if is_accurate else "LOW"
                 log(
-                    f"[{idx + 1}/{total}] {status_text} {result['lng']},{result['lat']} "
-                    f"({result.get('address', '')}){sim_warn} (相似度:{sim:.0%})"
+                    f"[{idx + 1}/{total}] {quality} {result['lng']},{result['lat']} "
+                    f"({result.get('address') or result.get('name', '')}) "
+                    f"(相似度:{similarity:.0%})"
                 )
         else:
             fail += 1
@@ -194,10 +158,44 @@ def process_amap_excel(
                 log(f"[{idx + 1}/{total}] FAIL")
 
         if status:
-            pct = (idx + 1) / total * 100 if total else 100
-            status(pct, f"处理中 {idx + 1}/{total}")
+            percent = (idx + 1) / total * 100 if total else 100
+            status(percent, f"处理中 {idx + 1}/{total}")
         time.sleep(sleep_seconds)
 
-    output_file = Path(output_path) if output_path else input_file.with_name(f"{input_file.stem}_经纬度.xlsx")
+    output_file = Path(output_path) if output_path else input_file.with_name(
+        f"{input_file.stem}_{_provider_label(provider)}经纬度.xlsx"
+    )
     df.to_excel(output_file, index=False, engine="openpyxl")
     return BatchSummary(output_file, accurate, low, fail, total)
+
+
+def process_amap_excel(
+    file_path: str | Path,
+    output_path: str | Path | None = None,
+    log: ProgressCallback | None = None,
+    status: StatusCallback | None = None,
+    sleep_seconds: float = 0.15,
+    city: str = "",
+) -> BatchSummary:
+    """Compatibility wrapper for an AMap-only Excel batch run."""
+    return process_excel(file_path, "amap", output_path, log, status, sleep_seconds, city)
+
+
+def _row_queries(row: pd.Series, city: str) -> tuple[str, ...]:
+    address = _cell_text(row, "地址")
+    name = _cell_text(row, "名称")
+    old_name = _cell_text(row, "原名称")
+    queries: list[str] = []
+    if address and len(address) > 3:
+        queries.append(address)
+    if name and len(name) > 2 and name not in {"居民住宅", "幼儿园"}:
+        queries.append(f"{city}{name}")
+    if old_name and len(old_name) > 2:
+        queries.append(f"{city}{old_name}")
+    if name and address:
+        queries.append(f"{name} {address}")
+    return tuple(dict.fromkeys(queries))
+
+
+def _provider_label(provider: ProviderName) -> str:
+    return {"amap": "高德", "baidu": "百度", "auto": "自动"}[provider]

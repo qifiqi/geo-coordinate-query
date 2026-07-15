@@ -8,15 +8,14 @@ from pathlib import Path
 import sys
 from typing import Any
 
-from geo_coordinate_query.baidu_excel_processor import process_baidu_excel
 from geo_coordinate_query.batch_convert import convert_coordinate_excel
 from geo_coordinate_query.config import get_api_key, get_baidu_ak, get_config, update_config
 from geo_coordinate_query.coordinates import gcj02_to_wgs84, wgs84_to_gcj02
-from geo_coordinate_query.excel_processor import process_amap_excel
-from geo_coordinate_query.map_services import baidu_smart_search, smart_search
+from geo_coordinate_query.excel_processor import process_excel
 from geo_coordinate_query.matching import address_similarity
+from geo_coordinate_query.query_service import PlaceQueryService, ProviderName
 
-Provider = str
+Provider = ProviderName
 
 
 def _print_json(data: Any) -> None:
@@ -60,19 +59,17 @@ def cmd_config(args: argparse.Namespace) -> int:
     return 0
 
 
-def _query(provider: Provider, keyword: str) -> dict[str, Any] | None:
-    if provider == "amap":
-        return smart_search(keyword)
-    if provider == "baidu":
-        return baidu_smart_search(keyword)
-    raise ValueError(f"不支持的地图服务: {provider}")
+def _query(provider: Provider, keyword: str, city: str) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+    candidates = PlaceQueryService().search(keyword, city, provider)
+    records = [candidate.as_dict() for candidate in candidates]
+    return (records[0] if records else None), records
 
 
 def cmd_query(args: argparse.Namespace) -> int:
-    result = _query(args.provider, args.keyword)
+    result, candidates = _query(args.provider, args.keyword, args.city)
     if not result:
         if args.json:
-            _print_json({"ok": False, "keyword": args.keyword, "provider": args.provider})
+            _print_json({"ok": False, "keyword": args.keyword, "provider": args.provider, "candidates": []})
         else:
             print("未找到结果")
         return 2
@@ -84,7 +81,10 @@ def cmd_query(args: argparse.Namespace) -> int:
         result = {**result, "similarity": address_similarity(args.keyword, result)}
 
     if args.json:
-        _print_json({"ok": True, "keyword": args.keyword, "provider": args.provider, "result": result})
+        output = {"ok": True, "keyword": args.keyword, "provider": args.provider, "result": result}
+        if args.candidates:
+            output["candidates"] = candidates
+        _print_json(output)
     else:
         print(f"服务: {args.provider}")
         print(f"关键词: {args.keyword}")
@@ -104,22 +104,14 @@ def cmd_batch(args: argparse.Namespace) -> int:
     output_file = Path(args.output) if args.output else None
     logger = None if args.quiet else print
 
-    if args.provider == "amap":
-        summary = process_amap_excel(
-            input_file,
-            output_path=output_file,
-            log=logger,
-            sleep_seconds=args.delay,
-        )
-    elif args.provider == "baidu":
-        summary = process_baidu_excel(
-            input_file,
-            output_path=output_file,
-            log=logger,
-            sleep_seconds=args.delay,
-        )
-    else:
-        raise ValueError(f"不支持的地图服务: {args.provider}")
+    summary = process_excel(
+        input_file,
+        provider=args.provider,
+        output_path=output_file,
+        log=logger,
+        sleep_seconds=args.delay,
+        city=args.city,
+    )
 
     if args.json:
         _print_json(_summary_to_dict(summary))
@@ -176,16 +168,19 @@ def build_parser() -> argparse.ArgumentParser:
 
     query = subparsers.add_parser("query", help="查询单个地址或建筑名称")
     query.add_argument("keyword", help="地址、建筑名或 POI 关键词")
-    query.add_argument("-p", "--provider", choices=["amap", "baidu"], default="amap", help="地图服务")
+    query.add_argument("-p", "--provider", choices=["amap", "baidu", "auto"], default="auto", help="地图服务")
+    query.add_argument("--city", default="", help="城市名称，用于限制 POI 搜索范围")
     query.add_argument("--wgs84", action="store_true", help="同时输出 WGS-84 坐标")
     query.add_argument("--similarity", action="store_true", help="输出输入关键词与结果地址的相似度")
+    query.add_argument("--candidates", action="store_true", help="JSON 输出中包含全部候选地点")
     query.add_argument("--json", action="store_true", help="以 JSON 输出")
     query.set_defaults(func=cmd_query)
 
     batch = subparsers.add_parser("batch", help="批量查询 Excel 文件")
     batch.add_argument("input", help="输入 Excel 文件，需包含 地址/名称/原名称 等列")
-    batch.add_argument("-p", "--provider", choices=["amap", "baidu"], default="amap", help="地图服务")
+    batch.add_argument("-p", "--provider", choices=["amap", "baidu", "auto"], default="auto", help="地图服务")
     batch.add_argument("-o", "--output", help="输出 Excel 文件路径")
+    batch.add_argument("--city", default="", help="城市名称；空值时优先读取输入表的“城市”列")
     batch.add_argument("--delay", type=float, default=0.15, help="每行请求间隔秒数")
     batch.add_argument("-q", "--quiet", action="store_true", help="不输出逐行处理日志")
     batch.add_argument("--json", action="store_true", help="以 JSON 输出处理摘要")
